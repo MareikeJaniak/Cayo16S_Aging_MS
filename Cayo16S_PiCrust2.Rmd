@@ -1,0 +1,847 @@
+---
+title: "PiCrust2 Cayo 16S"
+output:
+  html_document:
+    code_folding: hide
+---
+
+Load packages:
+```{r, results='hide'}
+x<-c("ggplot2", "dada2", "vegan", "tidyr","car","DESeq2", "phyloseq","FSA", "lme4", "ggpubr", "reshape2", "ALDEx2", "forestmangr", "FunkyTax", "stringr", "dpylr")
+lapply(x, require, character.only = TRUE)
+```
+
+I ran PiCrust on Compute Canada with following command:
+```{bash}
+picrust2_pipeline.py -s /home/mcj43/scratch/CayoMB/PiCrust2/rectal/rectal_input/rectal_seqs.fasta -i /home/mcj43/scratch/CayoMB/PiCrust2/rectal/rectal_input/rectal_otu.tsv -o /home/mcj43/scratch/CayoMB/PiCrust2/rectal/rectal_output/picrust2_out_pipeline --stratified --per_sequence_contrib --wide_table -p 4
+```
+
+Add descriptions to EC and pathways:
+```{bash}
+add_descriptions.py -i EC_metagenome_out/pred_metagenome_unstrat.tsv.gz -m EC -o EC_metagenome_out/pred_metagenome_unstrat_descrip.tsv.gz
+
+add_descriptions.py -i pathways_out/path_abun_unstrat.tsv.gz -m METACYC -o pathways_out/path_abun_unstrat_descrip.tsv.gz
+```
+
+Get KEGG pathways from KO:
+```{bash}
+pathway_pipeline.py -i KO_metagenome_out/pred_metagenome_strat.tsv -o KEGG_pathways_out --no_regroup --map picrust2/picrust2/default_files/pathway_mapfiles/KEGG_pathways_to_KO.tsv
+```
+
+Add higher level METACYC descriptions of pathways:
+
+```{bash}
+add_descriptions.py -i pathways_out/path_abun_strat.tsv.gz --custom_map_tabl ../../../picrust_mapping/metacyc_pathways_info_prokaryotes_sec_level.tsv -o pathways_out/path_abun_strat_descrip_level2.tsv.gz
+```
+
+
+### Load metadata:
+
+```{r}
+dataset <- read.csv("./Cayo16S_metadata_July2019.csv",header=T,row.names = 1)
+quant_data <- read.delim("../../Cayo16S_copy_number_data.tsv", header = T)
+quant_data <- quant_data$copy_number
+
+dataset$sample_ID <- rownames(dataset)
+
+dataset <- cbind(dataset, quant_data)
+
+dataset$control <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$sample_type[i]== "negcontrol"){
+    dataset$control[i] <- "Yes"
+  }
+  if (dataset$sample_type[i]== "poscontrol"){
+    dataset$control[i] <- "Yes"
+  }
+}
+
+dataset$age[is.na(dataset$age)] <- -1
+
+dataset$infant <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 0){
+    dataset$infant[i] <- "Yes"
+  }
+}
+
+dataset$age_group <- "<1"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 1| dataset$age[i] == 2| dataset$age[i] == 3 | dataset$age[i] == 4){
+    dataset$age_group[i] <- "1-4"
+  }
+  else if (dataset$age[i] == 5| dataset$age[i] == 6| dataset$age[i] == 7 | dataset$age[i] == 8 | dataset$age[i] == 9){
+    dataset$age_group[i] <- "5-9"
+  }
+  else if (dataset$age[i] == 10 | dataset$age[i] == 11| dataset$age[i] == 12 | dataset$age[i] == 13 | dataset$age[i] == 14){
+    dataset$age_group[i] <- "10-14"
+  }
+  else if (dataset$age[i] == 15| dataset$age[i] >= 15){
+    dataset$age_group[i] <- "≥15"
+  }
+  else if (dataset$age[i] == -1){
+    dataset$age_group[i] <- NA
+  }
+}
+
+dataset$age_group[is.na(dataset$age_group)] <- "other"
+
+dataset$old <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] >= 15){
+    dataset$old[i] <- "Yes"
+  }
+}
+
+dataset[dataset==-1] <- NA
+
+dataset$sex <- as.character(dataset$sex)
+
+rectal_dataset <- subset(dataset, sample_type == "rectal" | sample_ID == "NegCtrl13")
+rectal_dataset <- subset(rectal_dataset, sample_ID != "NegCtrl13" & sample_ID != "MB103960" & sample_ID != "MB105898")
+
+genital_dataset <- subset(dataset, sample_type == "genital" | sample_ID == "NegCtrl3")
+genital_dataset <- subset(genital_dataset, sample_ID != "MB103805" & sample_ID != "MB105080" & sample_ID != "MB102071" & sample_ID != "MB000217" & sample_ID!= "NegCtrl3")
+
+buccal_dataset <- subset(dataset, sample_type=="buccal")
+buccal_dataset <- subset(buccal_dataset, sample_ID != "MB103963" )
+```
+
+### PiCrust2 analysis with FunkyTax
+* Used in paper on bat age differences with PiCrust output (Hughes et al. 2018)
+
+Save metadata for FunkyTax as csvs:
+* Create folder PiCrust2_in to keep things organized
+```{r}
+write.csv(rectal_dataset, "./PiCrust2_in/rectal_dataset_FunkyTax.csv")
+write.csv(genital_dataset, "./PiCrust2_in/genital_dataset_FunkyTax.csv")
+write.csv(buccal_dataset, "./PiCrust2_in/buccal_dataset_FunkyTax.csv")
+```
+
+Annotations for PiCrust KO output:
+* Used later to annotate KEGG pathways and level 3 information
+* Pathway files available in PiCrust2 installation
+```{r}
+KEGG_info <- read.delim("../pathway_mapfiles/KEGG_pathways_info.tsv", header = FALSE, row.names = 1)
+```
+
+#### FunkyTax Steps on Compute Canada
+
+* steps for rectal samples as an example, run on Compute Canada with the scripts "TaFuR_FunkyTax.R" and "FunkyTax_func_data_to_count_matrix.R"
+
+Use output from PiCrust2 labeled "pred_metagenome_contrib.tsv"
+* save PiCrust2 output in new folder to keep things organized
+```{r}
+rectal_func_dat <- read.delim("./PiCrust2_out/rectal_KO_pred_metagenome_contrib.tsv", header = TRUE)
+```
+
+Rename sample column to be consistent with metadata column name:
+* Note: due to error in package function, the sample column has to be named "Sample"
+* Run on ComputeCanada
+```{r}
+rectal_func_dat_tax <- rename(rectal_func_dat_tax, c("Sample" = "sample", "Function" = "function."))
+rectal_met <- rectal_dataset
+rectal_met <- rename(rectal_met, "Sample" = "sample_ID")
+```
+
+Running TaFuR function on rectal PiCrust2 output:
+* run on cluster if possible
+```{r}
+TaFuR_out <- TaFuR(rectal_func_dat_tax, rectal_met, no.processors = 1, method = "bray", fact = "age_group", func_col = "Function", samp_col = "Sample", otu_col = "taxon", count_col = "taxon_function_abun")
+```
+
+For DESeq univariate tests, for comparison with TaFuR results:
+* Make OTU/Gene Function matrix by sample, summing Contributions of OTUs for each Gene for each sample
+* Run on Compute Canada with FunkyTax_func_data_to_count_matrix.R script
+(Note: this step isn't actually necessary - the PiCrust2 output "pred_metagenome_unstrat.tsv" contains the same data)
+```{r}
+CountMatrix <- reshape2::dcast(func_dat, Gene ~ Sample, sum, value.var = "taxon_function_abun")
+```
+
+* Note: bugs in FunkyTax functions. Use the updated function (CatFun2) in the script "Updated_CatFun_function.R"
+
+```{r}
+source("./Updated_CatFun_function.R")
+```
+
+#### FunkyTax Rectal
+
+Read in rectal dataset (if not already in environment):
+```{r}
+rectal_dataset = read.csv("./PiCrust2_in/rectal_dataset_FunkyTax.csv", header = TRUE, row.names = 1)
+```
+
+Read in TaFuR out RDS (from running first FunkyTax step on Compute Canada):
+* save output documents in folder PiCrust2_out to keep things organized
+```{r}
+rectal_TaFuR <- readRDS("./PiCrust2_out/rectal_TaFuR_out.rds")
+```
+
+Read in the PiCrust2 output file "pred_metagenome_unstrat.tsv"
+```{r}
+rectalCountMatrix <- readRDS("./PiCrust2_out/pred_metagenome_unstrat.tsv")
+rectalCountMatrix <- round_df(rectalCountMatrix, digits = 0)
+```
+
+Make DESeq dds object
+```{r}
+rectal_dds_in <- DESeqDataSetFromMatrix(countData=rectalCountMatrix, colData=rectal_dataset, design=~age_group, tidy = TRUE)
+```
+
+Run DESeq to identify Genes/Functions that are differentially expressed between age groups. 
+* Use LRT test to compare multiple groups
+```{r}
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object
+geoMeans = apply(counts(rectal_dds_in), 1, gm_mean)
+rectal_dds_in = estimateSizeFactors(rectal_dds_in, geoMeans = geoMeans)
+
+rectal_dds_out <- DESeq(rectal_dds_in, test = "LRT", reduced = ~1)
+```
+
+* From DESeq results, pairwise comparisons between age groups are made
+```{r}
+res.rectal.dds_out1 = results(rectal_dds_out, contrast = c("age_group", "<1", "1-4"))
+
+alpha = 0.01
+
+# keep only significant results
+sigtab.rectal.dds_out1 = res.rectal.dds_out1[which(res.rectal.dds_out1$padj < alpha), ]
+```
+
+
+##### CatFun for Rectal Samples
+
+Compares DESeq and TaFuR results and categorizes pathways as one of the following:
+Conserved (ns for both) - Frequency of function and contributing community does not differ among groups
+Equivalent (ns DESeq, sig TaFuR) - Frequency of function does not differ among groups but contributing community differs
+Enhanced (sig DESeq, ns TaFuR) - Frequency of function differs among groups but contributing community does not
+Divergent (sig for both) - Frequency of function and contributing community differs among groups
+
+* run CatFun
+```{r}
+rectal_CatFun <- CatFun2(rectal_TaFuR, res.rectal.dds_out1, alpha = 0.01)
+```
+
+* Visualize
+```{r}
+p_rectal_CatFun <- rectal_CatFun[[1]]
+p_rectal_CatFun <- p_rectal_CatFun + 
+  ggtitle(label = "Rectal", subtitle = "n = 5668") +
+  theme(plot.title = element_text(face = "bold"),
+        title = element_text(size = 10))
+```
+
+
+### Rectal LEfSe analyses of PiCrust2 output
+
+Set age group and infant order for figures:
+```{r}
+rectal_dataset$age_group <- factor(rectal_dataset$age_group, levels = c("<1", "1-4", "5-9", "10-14", "≥15"))
+rectal_dataset$infant <- factor(rectal_dataset$infant, levels = c("Yes", "No"))
+```
+
+Use PiCrust2 pathway output
+```{r}
+rectal_PiCrust_pathways <- read.delim("./PiCrust2_out/rectal_path_abun_unstrat.tsv", sep = "\t", header = TRUE, stringsAsFactors = TRUE, row.names = 1)
+```
+
+Make phyloseq object and transform to relative abundances
+```{r}
+ps_pw_rectal <- phyloseq(sample_data(rectal_dataset), otu_table(as.matrix(rectal_PiCrust_pathways), taxa_are_rows = TRUE), tax_table(as.matrix(KEGG_info)))
+
+ps_pw_rectal_prop <- transform_sample_counts(ps_pw_rectal, function(otu) otu/sum(otu))
+```
+
+Calculate distances and ordination
+```{r}
+bray_pw_rectal <- distance(ps_pw_rectal_prop, method = "bray")
+ord.bray_pw_rectal <- ordinate(ps_pw_rectal_prop, method = "NMDS", distance = "bray")
+```
+
+Plot:
+```{r}
+rectal_ord_pw <- plot_ordination(ps_pw_rectal_prop, ord.bray_pw_rectal, color = "infant", shape = "age_group")
+
+p_ord_rectal_pw <- rectal_ord_pw + theme_classic() +
+  scale_color_manual(name = "Infant", values = c("cornflowerblue", "purple")) + 
+  scale_shape_manual(name = "Age group", values = c(16, 18, 0, 1, 17)) +
+  ggtitle(label = "Rectal", subtitle ="Predicted functional features") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_ord_rectal_pw
+```
+
+#### PERMANOVA
+* Do predicted pathway abundances vary across age groups?
+```{r}
+permanova.rectal.pw.age_group<-adonis(bray_pw_rectal ~ age_group + sex, data=rectal_dataset, permutations = 9999)
+permanova.rectal.pw.age_group$aov.tab
+```
+
+Pairwise post-hoc PERMANOVA
+Which age group is driving differences?
+```{r}
+pairwise.adonis(bray_pw_rectal, rectal_dataset$age_group)
+```
+
+### LEfSe
+* Use LEfSe to look for features most likely to explain differences between age groups
+
+make relative abundance matrix from picrust pathway output
+```{r}
+rectal_pw_rel_abun <- as.data.frame(otu_table(ps_pw_rectal_prop, taxa_are_rows=TRUE))
+```
+
+Add metadata rows to table, as required by LEfSe
+```{r}
+metadata <- select(rectal_dataset, sample_ID, age_group)
+metadata <- as.data.frame(t(metadata), stringsAsFactors=FALSE)
+
+LEfSE_in_rectal_pw <- rbind.data.frame(metadata, rectal_pw_rel_abun)
+```
+
+Write to txt file for use outside of R
+```{r}
+write.table(LEfSE_in_rectal_pw, "./LEfSe/rectal/rectal_PiCrust2_pathways_LEfSe.txt", quote = FALSE, sep = "\t", col.names = FALSE)
+```
+
+Use command-line version of LEfSe to run, using the following commands
+```{bash}
+# format input file (for age group comparison)
+format_input.py ./LEfSe/rectal/rectal_PiCrust2_pathways_LEfSe.txt ./LEfSe/rectal/rectal_PiCrust2_pathways_LEfSe.in -c 2 -u 1 -o 1000000
+
+# run LEfSe (on age group comparison)
+run_lefse.py ./LEfSe/rectal/rectal_PiCrust2_pathways_LEfSe.in ./LEfSe/rectal/rectal_PiCrust2_pathways_LEfSe.res
+
+# default plot (script doesn't like symbols like ≥)
+plot_res.py ./LEfSe/rectal/rectal_PiCrust2_pathways_LEfSe.res ./LEfSe/rectal/rectal_PiCrust2_pathways_LEfSe.png
+```
+
+### Make better plot for LEfSe results
+```{r}
+# read in results
+rectal_LEfSe_res <- read.delim("./LEfSe/rectal/rectal_PiCrust2_pathways_LEfSe.res", sep = "\t", header = FALSE)
+
+# merge with pathway info
+rectal_LEfSe_res <- merge(rectal_LEfSe_res, KEGG_info, by.x = "V1", by.y = "row.names")
+rectal_LEfSe_res <- select(rectal_LEfSe_res, -V3.y)
+
+rectal_LEfSe_res <- rectal_LEfSe_res %>% drop_na(V4.x)
+```
+
+Plot
+```{r}
+p_LDA_rectal <- ggplot(rectal_LEfSe_res
+       %>% mutate(V3.x = factor(V3.x, levels=c("<1","1-4","5-9","≥15")))
+       %>% arrange(V3.x, desc(V4.x)) 
+       %>% mutate(V2.y = factor(V2.y, levels = V2.y)), 
+       aes(V4.x, V2.y, fill = V3.x)) + 
+  geom_col(width = 0.5) +
+  theme_classic() +
+  ylab(NULL) +
+  xlab("LDA Score (log 10)") +
+  scale_fill_manual(name = "Age group", values = c("#088BBE", "#F8CD9C", "#1BB6AF")) +
+  guides(fill = F) +
+  ggtitle(label = "Rectal") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_LDA_rectal
+```
+
+
+#### FunkyTax Genital
+
+Read in TaFuR out RDS (from running first FunkyTax step on Compute Canada):
+```{r}
+genital_TaFuR <- readRDS("./PiCrust2_out/genital_TaFuR_out.rds")
+```
+
+Read in count matrix rds and round:
+(Note: could also read in the PiCrust2 output file "pred_metagenome_unstrat.tsv" instead)
+```{r}
+genitalCountMatrix <- readRDS("./PiCrust2_out/genital_CountMatrix.rds")
+
+genitalCountMatrix <- round_df(genitalCountMatrix, digits = 0)
+```
+
+
+If not already loaded, read in genital dataset with metadata:
+```{r}
+genital_dataset <- read.csv("./PiCrust2_in/genital_dataset_FunkyTax.csv", header = TRUE, row.names = 1)
+```
+
+Make DESeq dds object
+```{r}
+genital_dds_in <- DESeqDataSetFromMatrix(countData=genitalCountMatrix, colData=genital_dataset, design=~age_group, tidy = TRUE)
+```
+
+Run DESeq to identify Genes/Functions that are differentially expressed between age groups. 
+* Use LRT test to compare multiple groups
+```{r}
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object
+geoMeans = apply(counts(genital_dds_in), 1, gm_mean)
+genital_dds_in = estimateSizeFactors(genital_dds_in, geoMeans = geoMeans)
+
+genital_dds_out <- DESeq(genital_dds_in, test = "LRT", reduced = ~1)
+```
+
+* From DESeq results, pairwise comparisons between age groups are made
+```{r}
+res.genital.dds_out1 = results(genital_dds_out, contrast = c("age_group", "<1", "1-4"))
+
+alpha = 0.01
+
+# keep only significant results
+sigtab.genital.dds_out1 = res.genital.dds_out1[which(res.genital.dds_out1$padj < alpha), ]
+```
+
+##### CatFun for Genital Samples
+
+Compares DESeq and TaFuR results and categorizes pathways as one of the following:
+Conserved (ns for both) - Frequency of function and contributing community does not differ among groups
+Equivalent (ns DESeq, sig TaFuR) - Frequency of function does not differ among groups but contributing community differs
+Enhanced (sig DESeq, ns TaFuR) - Frequency of function differs among groups but contributing community does not
+Divergent (sig for both) - Frequency of function and contributing community differs among groups
+
+* run CatFun
+```{r}
+genital_CatFun <- CatFun2(genital_TaFuR, res.genital.dds_out1, alpha = 0.01)
+```
+
+* Visualize
+```{r}
+p_genital_CatFun <- genital_CatFun[[1]]
+p_genital_CatFun <- p_genital_CatFun + 
+  ggtitle(label = "Genital", subtitle = "n = 6031") +
+  theme(plot.title = element_text(face = "bold"),
+        title = element_text(size = 10))
+```
+
+### Genital LEfSe analyses of PiCrust2 output
+
+Sort age group and infant levels for figures:
+```{r}
+genital_dataset$age_group <- factor(genital_dataset$age_group, levels = c("<1", "1-4", "5-9", "10-14", "≥15"))
+genital_dataset$infant <- factor(genital_dataset$infant, levels = c("Yes", "No"))
+```
+
+#### Age
+
+Use PiCrust2 pathway output
+```{r}
+genital_PiCrust_pathways <- read.delim("./PiCrust2_out/genital_path_abun_unstrat.tsv", sep = "\t", header = TRUE, stringsAsFactors = TRUE, row.names = 1)
+```
+
+Make phyloseq object and transform to relative abundances
+```{r}
+ps_pw_genital <- phyloseq(sample_data(genital_dataset), otu_table(as.matrix(genital_PiCrust_pathways), taxa_are_rows = TRUE), tax_table(as.matrix(KEGG_info)))
+
+ps_pw_genital_prop <- transform_sample_counts(ps_pw_genital, function(otu) otu/sum(otu))
+```
+
+Calculate distances and plot ordination
+```{r}
+bray_pw_genital <- distance(ps_pw_genital_prop, method = "bray")
+ord.bray_pw_genital <- ordinate(ps_pw_genital_prop, method = "NMDS", distance = "bray")
+
+plot_ordination(ps_pw_genital_prop, ord.bray_pw_genital, color = "infant")
+```
+
+#### PERMANOVA
+* Do predicted pathway abundances vary across age groups?
+```{r}
+permanova.genital.pw.age_group<-adonis(bray_pw_genital ~ age_group + sex, data=genital_dataset, permutations = 9999)
+permanova.genital.pw.age_group$aov.tab
+```
+
+Pairwise post-hoc PERMANOVA
+Which age group is driving differences?
+```{r}
+pairwise.adonis(bray_pw_genital, genital_dataset$age_group)
+```
+
+### LEfSe
+* Use LEfSe to look for features most likely to explain differences between age groups
+
+make relative abundance matrix from picrust pathway output
+```{r}
+genital_pw_rel_abun <- as.data.frame(otu_table(ps_pw_genital_prop, taxa_are_rows=TRUE))
+```
+
+Add metadata rows to table, as required by LEfSe
+```{r}
+metadata <- select(genital_dataset, sample_ID, age_group)
+metadata <- as.data.frame(t(metadata), stringsAsFactors=FALSE)
+
+LEfSE_in_genital_pw <- rbind.data.frame(metadata, genital_pw_rel_abun)
+```
+
+Write to txt file for use outside of R
+```{r}
+write.table(LEfSE_in_genital_pw, "./LEfSe/genital/genital_PiCrust2_pathways_LEfSe.txt", quote = FALSE, sep = "\t", col.names = FALSE)
+```
+
+Use command-line version of LEfSe to run, using the following commands
+```{bash}
+# format input file (for age group comparison)
+format_input.py ./LEfSe/genital/genital_PiCrust2_pathways_LEfSe.txt ./LEfSe/genital/genital_PiCrust2_pathways_LEfSe.in -c 2 -u 1 -o 1000000
+
+# run LEfSe (on age group comparison)
+run_lefse.py ./LEfSe/genital/genital_PiCrust2_pathways_LEfSe.in ./LEfSe/genital/genital_PiCrust2_pathways_LEfSe.res -a 0.01 -w 0.01
+
+# default plot (doesn't like special symbols, like ≥)
+plot_res.py ./LEfSe/genital/genital_PiCrust2_pathways_LEfSe.res ./LEfSe/genital/genital_PiCrust2_pathways_LEfSe.png
+```
+
+### Make better plot for LEfSe results
+```{r}
+# read in results
+genital_LEfSe_res <- read.delim("./LEfSe/genital/genital_PiCrust2_pathways_LEfSe.res", sep = "\t", header = FALSE)
+
+# merge with pathway info
+genital_LEfSe_res <- merge(genital_LEfSe_res, KEGG_info, by.x = "V1", by.y = "row.names")
+genital_LEfSe_res <- select(genital_LEfSe_res, -V3.y)
+
+genital_LEfSe_res <- genital_LEfSe_res %>% drop_na(V4.x)
+```
+
+Plot (no significant results to plot)
+```{r}
+#ggplot(genital_LEfSe_res
+#       %>% mutate(V3.x = factor(V3.x, levels=c("<1","1-4","5-9","10-14","≥15")))
+#       %>% arrange(V3.x, desc(V4.x)) 
+#       %>% mutate(V2.y = factor(V2.y, levels = V2.y)), 
+#       aes(V4.x, V2.y, fill = V3.x)) + 
+#  geom_col(width = 0.5) +
+#  theme_classic() +
+#  ylab(NULL) +
+#  xlab("LDA Score (log 10)") +
+#  scale_fill_manual(name = "Age group", values = c("#088BBE", "#172869", "#F6A1A5", "#1BB6AF")) +
+#  guides(fill = guide_legend(reverse = TRUE)) +
+#  ggtitle(label = "PiCrust2 - genital", subtitle = "LDA by age group") +
+#  theme(plot.title = element_text(face = "bold"))
+```
+
+
+##### Genital PiCrust2 results by sex - LEfSe
+
+Calculate distances and ordination
+```{r}
+bray_pw_genital <- distance(ps_pw_genital_prop, method = "bray")
+ord.bray_pw_genital <- ordinate(ps_pw_genital_prop, method = "NMDS", distance = "bray")
+
+NMDS_df_genital_pw <- as.data.frame(ord.bray_pw_genital$points)
+genital_dataset$NMDS1_pw <- NMDS_df_genital_pw$MDS1
+genital_dataset$NMDS2_pw <- NMDS_df_genital_pw$MDS2
+```
+
+Plot
+```{r}
+p_genital_ord_pw <- ggplot(genital_dataset, aes(NMDS1_pw, NMDS2_pw, color = sex)) + 
+  geom_point(alpha = 1) + 
+  theme_classic() +
+  scale_color_manual(name = "Sex", values = c("#e7797a", "#8eb2d5")) +
+  ylab("NMDS2") +
+  xlab("NMDS1") +
+  ggtitle(label = "Genital", subtitle = "Predicted functional features") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_genital_ord_pw
+```
+
+#### PERMANOVA
+* Do predicted pathway abundances vary across age groups and sex?
+```{r}
+permanova.genital.pw.sex<-adonis(bray_pw_genital ~ age_group * sex, data=genital_dataset, permutations = 9999)
+permanova.genital.pw.sex$aov.tab
+```
+
+### LEfSe
+* Use LEfSe to look for features most likely to explain differences between sexes
+
+Add metadata rows to table, as required by LEfSe
+```{r}
+metadata <- select(genital_dataset, sample_ID, sex)
+metadata <- as.data.frame(t(metadata), stringsAsFactors=FALSE)
+
+LEfSE_in_genital_pw_sex <- rbind.data.frame(metadata, genital_pw_rel_abun)
+
+```
+
+Write to txt file for use outside of R
+```{r}
+write.table(LEfSE_in_genital_pw_sex, "./LEfSe/genital/genital_sex_PiCrust2_pathways_LEfSe.txt", quote = FALSE, sep = "\t", col.names = FALSE)
+```
+
+Use command-line version of LEfSe to run, using the following commands
+```{bash}
+# format input file (for age group comparison)
+format_input.py ./LEfSe/genital/genital_sex_PiCrust2_pathways_LEfSe.txt ./LEfSe/genital/genital_sex_PiCrust2_pathways_LEfSe.in -c 2 -u 1 -o 1000000
+
+# run LEfSe (on age group comparison)
+run_lefse.py ./LEfSe/genital/genital_sex_PiCrust2_pathways_LEfSe.in ./LEfSe/genital/genital_sex_PiCrust2_pathways_LEfSe.res -a 0.01 -w 0.01
+
+# default plot (doesn't like special symbols, like ≥)
+plot_res.py ./LEfSe/genital/genital_sex_PiCrust2_pathways_LEfSe.res ./LEfSe/genital/genital_sex_PiCrust2_pathways_LEfSe.png
+```
+
+### Make better plot for LEfSe results
+```{r}
+# read in results
+genital_sex_LEfSe_res <- read.delim("./LEfSe/genital/genital_sex_PiCrust2_pathways_LEfSe.res", sep = "\t", header = FALSE)
+
+# merge with pathway info
+genital_sex_LEfSe_res <- merge(genital_sex_LEfSe_res, KEGG_info, by.x = "V1", by.y = "row.names")
+genital_sex_LEfSe_res <- select(genital_sex_LEfSe_res, -V3.y)
+
+genital_sex_LEfSe_res <- genital_sex_LEfSe_res %>% drop_na(V4.x)
+```
+
+Plot
+```{r}
+p_LDA_genital_sex <- ggplot(genital_sex_LEfSe_res %>% arrange(V3.x, desc(V4.x))
+       %>% mutate(V2.y = factor(V2.y, levels = V2.y)), 
+       aes(V4.x, V2.y, fill = V3.x)) + 
+  geom_col(width = 0.5, alpha = 0.7) +
+  theme_classic() +
+  ylab(NULL) +
+  xlab("LDA Score (log 10)") +
+  scale_fill_manual(name = "Sex", values = c("#E41A1C", "#377EB8")) +
+  ggtitle(label = "Genital", subtitle = "Predicted pathways differentiating sexes") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_LDA_genital_sex
+
+ggsave("~/Documents/Data/Cayo_microbiome/Analysis/Figures/PiCrust2_genital_LDA.pdf", p_LDA_genital_sex, height = 8, width = 8, useDingbats = FALSE)
+```
+
+
+#### FunkyTax Buccal
+
+* Transfer RDS objects from Compute Canada
+
+Read in TaFuR out RDS (from running first FunkyTax step on Compute Canada):
+```{r}
+buccal_TaFuR <- readRDS("./PiCrust2_out/buccal_TaFuR_out.rds")
+```
+
+Read in count matrix rds and round:
+(Note: could also read in the PiCrust2 output file "pred_metagenome_unstrat.tsv" instead)
+```{r}
+buccalCountMatrix <- readRDS("./PiCrust2_out/buccal_CountMatrix.rds")
+buccalCountMatrix <- round_df(buccalCountMatrix, digits = 0)
+```
+
+Read in buccal dataset (if not already in environment):
+```{r}
+buccal_dataset <- read.csv("./PiCrust2_in/buccal_dataset_FunkyTax.csv", header = TRUE, row.names = 1)
+```
+
+Make DESeq dds object
+```{r}
+buccal_dds_in <- DESeqDataSetFromMatrix(countData=buccalCountMatrix, colData=buccal_dataset, design=~age_group, tidy = TRUE)
+```
+
+Run DESeq to identify Genes/Functions that are differentially expressed between age groups. 
+* Use LRT test to compare multiple groups
+```{r}
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object
+geoMeans = apply(counts(buccal_dds_in), 1, gm_mean)
+buccal_dds_in = estimateSizeFactors(buccal_dds_in, geoMeans = geoMeans)
+
+buccal_dds_out <- DESeq(buccal_dds_in, test = "LRT", reduced = ~1)
+```
+
+* From DESeq results, pairwise comparisons between age groups are made
+```{r}
+res.buccal.dds_out1 = DESeq2::results(buccal_dds_out, contrast = c("age_group", "<1", "1-4"))
+#res.buccal.dds_out2 = results(buccal_dds_out, contrast = c("age_group", "1-4", "5-9"))
+#res.buccal.dds_out3 = results(buccal_dds_out, contrast = c("age_group", "5-9", "10-14"))
+#res.buccal.dds_out4 = results(buccal_dds_out, contrast = c("age_group", "10-14", "≥15"))
+
+alpha = 0.01
+
+# keep only significant results
+sigtab.buccal.dds_out1 = res.buccal.dds_out1[which(res.buccal.dds_out1$padj < alpha), ]
+#sigtab.buccal.dds_out2 = res.buccal.dds_out2[which(res.buccal.dds_out2$padj < alpha), ]
+#sigtab.buccal.dds_out3 = res.buccal.dds_out3[which(res.buccal.dds_out3$padj < alpha), ]
+#sigtab.buccal.dds_out4 = res.buccal.dds_out4[which(res.buccal.dds_out4$padj < alpha), ]
+```
+
+* Number of pathways (KEGG genes) that are different
+```{r}
+dim(sigtab.buccal.dds_out1)
+```
+
+##### CatFun for Buccal Samples
+
+Compares DESeq and TaFuR results and categorizes pathways as one of the following:
+Conserved (ns for both) - Frequency of function and contributing community does not differ among groups
+Equivalent (ns DESeq, sig TaFuR) - Frequency of function does not differ among groups but contributing community differs
+Enhanced (sig DESeq, ns TaFuR) - Frequency of function differs among groups but contributing community does not
+Divergent (sig for both) - Frequency of function and contributing community differs among groups
+
+* run CatFun
+```{r}
+buccal_CatFun <- CatFun2(buccal_TaFuR, res.buccal.dds_out1, alpha = 0.01)
+```
+
+* Visualize
+```{r}
+p_buccal_CatFun <- buccal_CatFun[[1]]
+p_buccal_CatFun <- p_buccal_CatFun + 
+  ggtitle(label = "Buccal", subtitle = "n = 4933") +
+  theme(plot.title = element_text(face = "bold"),
+        title = element_text(size = 10))
+
+p_buccal_CatFun
+```
+
+### Buccal LEfSe analyses of PiCrust2 output
+
+Sort age group and infant levels for figures:
+```{r}
+buccal_dataset$age_group <- factor(buccal_dataset$age_group, levels = c("<1", "1-4", "5-9", "10-14", "≥15"))
+buccal_dataset$infant <- factor(buccal_dataset$infant, levels = c("Yes", "No"))
+```
+
+Use PiCrust2 pathway output
+```{r}
+buccal_PiCrust_pathways <- read.delim("./PiCrust2_out/buccal_path_abun_unstrat.tsv", sep = "\t", header = TRUE, stringsAsFactors = TRUE, row.names = 1)
+```
+
+Make phyloseq object and transform to relative abundances
+```{r}
+ps_pw_buccal <- phyloseq(sample_data(buccal_dataset), otu_table(as.matrix(buccal_PiCrust_pathways), taxa_are_rows = TRUE), tax_table(as.matrix(KEGG_info)))
+
+ps_pw_buccal_prop <- transform_sample_counts(ps_pw_buccal, function(otu) otu/sum(otu))
+```
+
+Calculate distances and ordination
+```{r}
+bray_pw_buccal <- distance(ps_pw_buccal_prop, method = "bray")
+ord.bray_pw_buccal <- ordinate(ps_pw_buccal_prop, method = "NMDS", distance = "bray")
+```
+
+Plot
+```{r}
+buccal_ord_pw <- plot_ordination(ps_pw_buccal_prop, ord.bray_pw_buccal, color = "infant", shape = "age_group")
+
+p_ord_buccal_pw <- buccal_ord_pw + theme_classic() +
+  scale_color_manual(name = "Infant", values = c("cornflowerblue", "purple")) + 
+  scale_shape_manual(name = "Age group", values = c(16, 18, 0, 1, 17)) +
+  ggtitle(label = "Oral", subtitle = "Predicted functional features") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_ord_buccal_pw
+```
+
+#### PERMANOVA
+* Do predicted pathway abundances vary across age groups?
+```{r}
+permanova.buccal.pw.age_group<-adonis(bray_pw_buccal ~ age_group + sex, data=buccal_dataset, permutations = 9999)
+permanova.buccal.pw.age_group$aov.tab
+```
+
+Pairwise post-hoc PERMANOVA
+Which age group is driving differences?
+```{r}
+pairwise.adonis(bray_pw_buccal, buccal_dataset$age_group)
+```
+
+### LEfSe
+* Use LEfSe to look for features most likely to explain differences between age groups
+
+make relative abundance matrix from picrust pathway output
+```{r}
+buccal_pw_rel_abun <- as.data.frame(otu_table(ps_pw_buccal_prop, taxa_are_rows=TRUE))
+```
+
+Add metadata rows to table, as required by LEfSe
+```{r}
+metadata <- select(buccal_dataset, sample_ID, age_group)
+metadata <- as.data.frame(t(metadata), stringsAsFactors=FALSE)
+
+LEfSE_in_buccal_pw <- rbind.data.frame(metadata, buccal_pw_rel_abun)
+```
+
+Write to txt file for use outside of R
+```{r}
+write.table(LEfSE_in_buccal_pw, "./LEfSe/buccal/buccal_PiCrust2_pathways_LEfSe.txt", quote = FALSE, sep = "\t", col.names = FALSE)
+```
+
+Use command-line version of LEfSe to run, using the following commands
+```{bash}
+# format input file (for age group comparison)
+format_input.py ./LEfSe/buccal/buccal_PiCrust2_pathways_LEfSe.txt ./LEfSe/buccal/buccal_PiCrust2_pathways_LEfSe.in -c 2 -u 1 -o 1000000
+
+# run LEfSe (on age group comparison)
+run_lefse.py ./LEfSe/buccal/buccal_PiCrust2_pathways_LEfSe.in ./LEfSe/buccal/buccal_PiCrust2_pathways_LEfSe.res -a 0.01 -w 0.01
+
+# default plot (doesn't like special symbols, like ≥)
+plot_res.py ./LEfSe/buccal/buccal_PiCrust2_pathways_LEfSe.res ./LEfSe/buccal/buccal_PiCrust2_pathways_LEfSe.png
+```
+
+### Make better plot for LEfSe results
+```{r}
+# read in results
+buccal_LEfSe_res <- read.delim("./LEfSe/buccal/buccal_PiCrust2_pathways_LEfSe.res", sep = "\t", header = FALSE)
+
+# merge with pathway info
+buccal_LEfSe_res <- merge(buccal_LEfSe_res, KEGG_info, by.x = "V1", by.y = "row.names")
+buccal_LEfSe_res <- select(buccal_LEfSe_res, -V3.y)
+
+buccal_LEfSe_res <- buccal_LEfSe_res %>% drop_na(V4.x)
+```
+
+Plot
+```{r}
+p_LDA_buccal <- ggplot(buccal_LEfSe_res
+       %>% mutate(V3.x = factor(V3.x, levels=c("<1","1-4","5-9","10-14","≥15"))) 
+       %>% arrange(V3.x, desc(V4.x)) 
+       %>% mutate(V2.y = factor(V2.y, levels = V2.y)), 
+       aes(V4.x, V2.y, fill = V3.x)) + 
+  geom_col(width = 0.5) +
+  theme_classic() +
+  ylab(NULL) +
+  xlab("LDA Score (log 10)") +
+  scale_fill_manual(name = "Age group", values = c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  ggtitle(label = "Oral") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_LDA_buccal
+```
+
+** Some of the figure objects below are generated in the "genital by sex" markdown file **
+
+Combo Figures
+```{r}
+combo_LDA <- ggarrange(ggarrange(p_LDA_rectal, p_LDA_buccal, p_vaginal_LDA, ncol = 1, common.legend = TRUE, legend = "right", labels = "auto", align = 'v', heights = c(0.4, 0.45, 0.15)), p_penile_LDA, nrow = 1, labels = c("","d"))
+
+combo_ord_pw <- ggarrange(ggarrange(p_ord_rectal_pw, p_ord_buccal_pw, nrow = 1, ncol = 2, labels = "auto"), ggarrange(p_ord_vaginal_pw, p_ord_penile_pw, p_genital_ord_pw, nrow = 2, ncol = 2, labels = c("c", "d", "e")), nrow = 2, heights = c(0.3333, 0.6667))
+
+combo_CatFun <- ggarrange(p_rectal_CatFun, p_buccal_CatFun, p_vaginal_CatFun, p_penile_CatFun, nrow = 4, common.legend = TRUE, legend = "right", labels = "auto")
+```
+
+Saving figures
+```{r}
+ggsave("./Figures/FunkyTax_Categories_combo.pdf", combo_CatFun, height = 10, width = 8, useDingbats = FALSE)
+
+ggsave("./Figures/PiCrust2_LDA_combo.pdf", combo_LDA, height = 7.5, width = 14, useDingbats =FALSE)
+
+ggsave("./Figures/PiCrust_ord_combo.pdf", combo_ord_pw, height = 10, width = 8, useDingbats = FALSE)
+```
+

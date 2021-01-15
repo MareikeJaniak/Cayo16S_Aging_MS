@@ -1,0 +1,1009 @@
+---
+title: "Cayo 16S Rectal Analyses"
+output:
+  html_document:
+    code_folding: hide
+---
+
+### RECTAL SAMPLES SEPARATELY
+
+**Downstream analyses - the dada2Code markdown file should be run first to generate the necessary input files**
+
+* Load libraries
+```{r packages, results='hide'}
+x<-c("ggplot2", "dada2", "vegan", "tidyr","car","DESeq2", "phyloseq","FSA", "lme4", "ggpubr", "reshape2", "decontam", "MuMIn", "pairwiseAdonis", "LaCroixColoR", "wesanderson", "dplyr", "scales")
+lapply(x, require, character.only = TRUE)
+```
+
+* Load seqtab, otu table, and taxa from dada2 pipeline
+```{r}
+seqtab.nochim <- readRDS("./seqtab.nochim_Cayo16S.rds")
+taxa <- read.csv("./taxaGF.csv", row.names = 1)
+```
+
+* Load metadata
+```{r}
+dataset <- read.csv("./Cayo16S_metadata_Aging_MS.txt",header=T,row.names = 1)
+quant_data <- read.delim("./Cayo16S_copy_number_data.tsv", header = T)
+quant_data <- quant_data$copy_number
+
+dataset$sample_ID <- rownames(dataset)
+
+dataset <- cbind(dataset, quant_data)
+
+dataset$control <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$sample_type[i]== "negcontrol"){
+    dataset$control[i] <- "Yes"
+  }
+  if (dataset$sample_type[i]== "poscontrol"){
+    dataset$control[i] <- "Yes"
+  }
+}
+
+dataset$age[is.na(dataset$age)] <- -1
+
+dataset$infant <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 0){
+    dataset$infant[i] <- "Yes"
+  }
+}
+
+dataset$age_group <- "<1"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 1| dataset$age[i] == 2| dataset$age[i] == 3 | dataset$age[i] == 4){
+    dataset$age_group[i] <- "1-4"
+  }
+  else if (dataset$age[i] == 5| dataset$age[i] == 6| dataset$age[i] == 7 | dataset$age[i] == 8 | dataset$age[i] == 9){
+    dataset$age_group[i] <- "5-9"
+  }
+  else if (dataset$age[i] == 10 | dataset$age[i] == 11| dataset$age[i] == 12 | dataset$age[i] == 13 | dataset$age[i] == 14){
+    dataset$age_group[i] <- "10-14"
+  }
+  else if (dataset$age[i] == 15| dataset$age[i] >= 15){
+    dataset$age_group[i] <- "≥15"
+  }
+  else if (dataset$age[i] == -1){
+    dataset$age_group[i] <- NA
+  }
+}
+
+dataset$age_group[is.na(dataset$age_group)] <- "other"
+
+dataset$old <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] >= 15){
+    dataset$old[i] <- "Yes"
+  }
+}
+
+dataset[dataset==-1] <- NA
+
+dataset$sex <- as.character(dataset$sex)
+```
+
+* Create rectal phyloseq subset and dataset for rectal metadata
+```{r}
+ps <- phyloseq(otu_table(as.matrix(seqtab.nochim), taxa_are_rows = FALSE), 
+               sample_data(dataset), 
+               tax_table(as.matrix(taxa)))
+
+ps_rectal <- subset_samples(ps, sample_type == "rectal" | sample_ID == "NegCtrl13")
+rectal_dataset <- subset(dataset, sample_type == "rectal" | sample_ID == "NegCtrl13")
+```
+
+### Decontamination
+
+#### Inspect Library Sizes
+
+Let’s take a quick first look at the library sizes (i.e. the number of reads) in each sample, as a function of whether that sample was a true positive sample or a negative control:
+
+* All data
+```{r}
+df <- as.data.frame(sample_data(ps)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=control)) + geom_point()
+```
+* Rectal only:
+
+```{r}
+df_rectal <- as.data.frame(sample_data(ps_rectal)) # Put sample_data into a ggplot-friendly data.frame
+df_rectal$LibrarySize <- sample_sums(ps_rectal)
+df_rectal <- df_rectal[order(df_rectal$LibrarySize),]
+df_rectal$Index <- seq(nrow(df_rectal))
+ggplot(data=df_rectal, aes(x=Index, y=LibrarySize, color=control)) + geom_point()
+```
+#### Identify Contaminants - Frequency
+
+The first contaminant identification method we’ll use is the “frequency” method. In this method, the distribution of the frequency of each sequence feature as a function of the input DNA concentration is used to identify contaminants.
+
+```{r}
+contamdf.freq <- isContaminant(ps_rectal, method="frequency", conc="quant_data")
+head(contamdf.freq)
+```
+
+This calculation has returned a data.frame with several columns, the most important being $p which containts the probability that was used for classifying contaminants, and $contaminant which contains TRUE/FALSE classification values with TRUE indicating that the statistical evidence that the associated sequence feature is a contaminant exceeds the user-settable threshold. As we did not specify the threshold, the default value of threshold = 0.1 was used, and $contaminant=TRUE if $p < 0.1.
+```{r}
+table(contamdf.freq$contaminant)
+head(which(contamdf.freq$contaminant))
+```
+
+In this plot the dashed black line shows the model of a noncontaminant sequence feature for which frequency is expected to be independent of the input DNA concentration. The red line shows the model of a contaminant sequence feature, for which frequency is expected to be inversely proportional to input DNA concentration, as contaminating DNA will make up a larger fraction of the total DNA in samples with very little total DNA. 
+
+```{r}
+plot_frequency(ps_rectal, taxa_names(ps_rectal)[which(contamdf.freq$contaminant)], conc="quant_data") + 
+  xlab("DNA Concentration (qPCR (molecules/ul))")
+```
+
+Remove contaminants and negative control for further analyses:
+```{r}
+ps_rectal <- prune_taxa(!contamdf.freq$contaminant, ps_rectal)
+
+# remove outliers
+ps_rectal <- subset_samples(ps_rectal, sample_ID != "NegCtrl13" & sample_ID != "MB103960" & sample_ID != "MB105898")
+rectal_dataset <- subset(rectal_dataset, sample_ID != "NegCtrl13" & sample_ID != "MB103960" & sample_ID != "MB105898")
+ps_rectal <- prune_taxa(taxa_sums(ps_rectal) > 0, ps_rectal)
+ps_rectal
+```
+
+### Taxonomic Filtering
+create a table of number of features for each Phylum present in the dataset
+```{r}
+rank_names(ps_rectal)
+table(tax_table(ps_rectal)[, "Phylum"], exclude = NULL)
+```
+Remove features with NA or ambiguous phylum annotation from dataset:
+```{r}
+ps_rectal <- subset_taxa(ps_rectal, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+ps_rectal
+```
+
+A useful next step is to explore feature prevalence in the dataset, which we will define here as the number of samples in which a taxon appears at least once.
+```{r}
+# Compute prevalence of each feature, store as data.frame
+prevdf = apply(X = otu_table(ps_rectal),
+               MARGIN = ifelse(taxa_are_rows(ps_rectal), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(ps_rectal),
+                    tax_table(ps_rectal))
+```
+
+Are there phyla that are comprised of mostly low-prevalence features? Compute the total and average prevalences of the features in each phylum.
+
+```{r}
+plyr::ddply(prevdf, "Phylum", function(df1){cbind(mean(df1$Prevalence),sum(df1$Prevalence))})
+```
+
+Filter phyla:
+```{r}
+filterPhylaRectal = c("Acidobacteria", "BRC1", "Gemmatimonadetes", "Rokubacteria", "Synergistetes", "Thaumarchaeota", "Cyanobacteria")
+ps_rectal = subset_taxa(ps_rectal, !Phylum %in% filterPhylaRectal)
+ps_rectal
+```
+
+#### Prevalence Filtering
+```{r}
+# Subset to the remaining phyla
+prevdf1 = subset(prevdf, Phylum %in% get_taxa_unique(ps_rectal, "Phylum"))
+ggplot(prevdf1, aes(TotalAbundance, Prevalence / nsamples(ps_rectal),color=Phylum)) +
+  # Include a guess for parameter
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 2) +  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+```
+
+Set prevalence threshold to five percent and remove taxa that occur in less than five percent of rectal samples:
+```{r}
+# Define prevalence threshold as 10% of total samples
+prevalenceThresholdRectal = 0.1 * nsamples(ps_rectal)
+prevalenceThresholdRectal
+```
+```{r}
+# Execute prevalence filter, using `prune_taxa()` function
+keepTaxaRectal = rownames(prevdf1)[(prevdf1$Prevalence >= 10)]
+ps_rectal = prune_taxa(keepTaxaRectal, ps_rectal)
+ps_rectal
+```
+
+Save phyloseq object for easy loading later, without need for redoing the filtering:
+*create separate folder to keep things organized
+```{r}
+saveRDS(ps_rectal, "./PhyloseqObjects/ps_rectal.rds")
+```
+
+Load filtered phyloseq object and dataset if not currently loaded:
+```{r}
+ps_rectal <- readRDS("./PhyloseqObjects/ps_rectal.rds")
+rectal_dataset = read.csv("./PiCrust2_in/rectal_dataset_FunkyTax.csv", header = TRUE, row.names = 1)
+```
+
+
+##### Obtaining files for PiCrust2
+*Save to separate folder to keep things organized
+
+* Rename ASVs with short name, instead of full sequence
+```{r, eval=FALSE}
+rectal_dna <- Biostrings::DNAStringSet(taxa_names(ps_rectal))
+names(rectal_dna) <- taxa_names(ps_rectal)
+ps_rectal_short <- merge_phyloseq(ps_rectal, rectal_dna)
+taxa_names(ps_rectal_short) <- paste0("ASV", seq(ntaxa(ps_rectal_short)))
+ps_rectal_short
+```
+
+* Save fasta file from phyloseq object
+```{r, eval=FALSE}
+Biostrings::writeXStringSet(refseq(ps_rectal_short), "./PiCrust2_in/rectal_seqs.fasta")
+```
+
+* Save otu table as csv with taxa as rows
+```{r, eval=FALSE}
+# Extract abundance matrix from the phyloseq object
+rectal_otu = as(otu_table(ps_rectal_short), "matrix")
+# transpose if necessary
+rectal_otu <- t(rectal_otu)
+# Coerce to data.frame
+rectal_otu_df = as.data.frame(rectal_otu)
+write.table(rectal_otu_df, "./PiCrust2_in/rectal_otu.tsv", sep = "\t", quote = FALSE)
+```
+
+### 1. Obtaining basic stats to report in methods.
+
+Number of ASVs per group and mean, min, and max per sample in the rectal group
+
+Per sample number of ASVs:
+```{r per group}
+sub<-which(dataset$sample_type=="rectal")
+pa_matrix<-decostand(seqtab.nochim,method="pa")
+apply(pa_matrix[sub,],1,sum) # view per sample number of ASVs
+```
+
+Number of samples that include the ASVs:
+```{r}
+hist(apply(pa_matrix[sub,],2,sum)) # nb of samples that include the ASVs
+```
+
+```{r, results='hide'}
+stem(apply(pa_matrix[sub,],2,sum)) # nb of samples that include the ASVs
+```
+
+Min, mean, and max number of ASVs per sample:
+```{r}
+summary(apply(pa_matrix[sub,],1,sum)) # get mean, min, and max of number of ASVs per sample
+```
+
+Histogram of distribution of number of ASVs per sample:
+```{r}
+hist(apply(pa_matrix[sub,],1,sum)) # see histogram of nb of ASVs per sample distribution
+```
+
+### DIVERSITY
+#### Alpha-diversity (Shannon) and species richness (Chao1)
+
+* CHAO1 and Shannon Index
+
+```{r computation}
+adiv<-estimate_richness(ps, measures=c("Observed","Shannon","Chao1"))
+adiv_rectal <- subset(adiv, rownames(adiv) %in% rownames(rectal_dataset))
+rectal_dataset$alphadiv<-adiv_rectal$Shannon
+hist(rectal_dataset$alphadiv)
+rectal_dataset$chao1<-adiv_rectal$Chao1
+hist(rectal_dataset$chao1)
+rectal_dataset$evenness<-adiv_rectal$Shannon/log(adiv_rectal$Observed)
+```
+
+#### Boxplots
+
+* Change order of x-axis for boxplots:
+```{r}
+rectal_dataset$age_group <- factor(rectal_dataset$age_group, levels = c("<1", "1-4", "5-9", "10-14", "≥15"))
+rectal_dataset$infant <- factor(rectal_dataset$infant, levels = c("Yes", "No"))
+rectal_dataset$old <- factor(rectal_dataset$old, levels = c("No", "Yes"))
+```
+
+* CHAO1 by age groups
+
+```{r}
+p_age_chao_rectal<-ggplot(rectal_dataset, aes(age_group, chao1,fill=age_group, color=age_group)) +
+  theme_classic()+
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("Age Group")+ylab("SPECIES RICHNESS (Chao1)")+
+  theme(axis.text.x  = element_text(size=12, color="black"),
+        axis.text.y  = element_text(size=12, color="black"),
+        axis.title.x  = element_text(size=14, color="black",face="bold"),
+        axis.title.y  = element_text(size=14, color="black",face="bold"))+
+  scale_fill_manual(name="Age group",values=c("blue","dodgerblue","purple","red", "cornflowerblue", "coral" )) +
+  scale_color_manual(name="Age group",values=c("black","black","black","black","black","black")) +
+  guides(fill=F,color=F) + stat_compare_means()
+p_age_chao_rectal
+```
+
+* Shannon Index by age groups
+
+```{r}
+p_age_shannon_rectal<-ggplot(rectal_dataset, aes(age_group, alphadiv,fill=age_group)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.8, outlier.shape = NA) +
+  geom_jitter(width=0.1) +
+  xlab("Age group")+ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Age group",values=c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  guides(fill=F) + 
+  stat_compare_means() + 
+  ggtitle(label = "Rectal") + 
+  theme(plot.title = element_text(face = "bold"))
+p_age_shannon_rectal
+```
+
+Compare individual groups to each other:
+
+```{r}
+my_comparisons <- list(c("<1", "1-4"), c("1-4", "5-9"), c("5-9", "10-14"), c("10-14", "≥15"))
+
+ggplot(rectal_dataset, aes(age_group, alphadiv,fill=age_group, color=age_group)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("Age Group")+ylab("ALPHA-DIVERSITY (Shannon Index)") +
+  scale_fill_manual(name="Age group",values=c("cornflowerblue","dodgerblue","purple","red", "blue")) +
+  scale_color_manual(name="Age group",values=c("black","black","black","black","black","black")) +
+  guides(fill=F,color=F) + stat_compare_means(comparisons = my_comparisons) + ggtitle(label = "Rectal") + theme(plot.title = element_text(face = "bold"))
+```
+
+
+* CHAO1 by infant yes or no
+
+```{r}
+p_infant_chao_rectal<-ggplot(rectal_dataset, aes(infant, chao1,fill=infant, color=infant)) +
+  theme_classic()+
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("Infant")+ylab("SPECIES RICHNESS (Chao1)")+
+  theme(axis.text.x  = element_text(size=12, color="black"),
+        axis.text.y  = element_text(size=12, color="black"),
+        axis.title.x  = element_text(size=14, color="black",face="bold"),
+        axis.title.y  = element_text(size=14, color="black",face="bold"))+
+  scale_fill_manual(name="Age group",values=c("cornflowerblue", "purple", "coral", "dodgerblue","red", "blue" )) +
+  scale_color_manual(name="Age group",values=c("black","black","black","black","black","black")) +
+  guides(fill=F,color=F) + stat_compare_means()
+p_infant_chao_rectal
+```
+
+* Shannon Index by infant yes or no
+
+```{r}
+p_infant_shannon_rectal<-ggplot(rectal_dataset, aes(infant, alphadiv,fill=infant)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) +
+  geom_jitter(width=0.1, height=0) +
+  ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Life stage", labels = c("infant", "non-infant"), values=c("cornflowerblue","purple")) +
+  scale_x_discrete(labels = c("infant", "non-infant")) +
+  guides(fill = F) +
+  stat_compare_means() + 
+  ggtitle(label = "Rectal") + 
+  theme(plot.title = element_text(face = "bold")) +
+  xlab("Life stage") +
+  ylim(1.5,5.5)
+p_infant_shannon_rectal 
+```
+
+* CHAO1 by old yes or no
+
+```{r}
+p1<-ggplot(rectal_dataset, aes(old, chao1,fill=old, color=old)) +
+  theme_bw()+
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("Old")+ylab("Species richness (Chao1)")+
+  theme(axis.text.x  = element_text(size=12, color="black"),
+        axis.text.y  = element_text(size=12, color="black"),
+        axis.title.x  = element_text(size=14, color="black",face="bold"),
+        axis.title.y  = element_text(size=14, color="black",face="bold"))+
+  guides(fill=F,color=F) + stat_compare_means()
+p1
+```
+
+* Shannon Index by old yes or no
+
+```{r}
+p_shannon_rectal_old<-ggplot(rectal_dataset, aes(old, alphadiv,fill=old)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) +
+  geom_jitter(width=0.1) +
+  xlab("15 years or older") +
+  ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Old",values=c("#AF6125", "#F4E3C7")) +
+  guides(fill=F,color=F) + stat_compare_means() + 
+  ggtitle(label = "Rectal") + theme(plot.title = element_text(face = "bold")) +
+  ylim(1.5,5.5)
+p_shannon_rectal_old 
+```
+
+* Shannon Index by sex
+
+```{r}
+p3_sex_rectal<-ggplot(rectal_dataset, aes(sex, alphadiv,fill=sex)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) +
+  geom_jitter(width=0.1) +
+  xlab("Sex")+
+  ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name = "Sex", values = c("#E41A1C", "#377EB8")) +
+  guides(fill=F) + 
+  stat_compare_means() + 
+  ggtitle(label = "Rectal") + 
+  theme(plot.title = element_text(face = "bold")) +
+  ylim(1.5,5.5)
+p3_sex_rectal
+```
+
+
+
+### Ordinations
+
+* Compute ordination (dada2 tutorial)
+```{r, results='hide'}
+# Ordination (from DADA2 tutorial)
+ps_rectal.prop <- transform_sample_counts(ps_rectal, function(otu) otu/sum(otu))
+
+bray_rectal <- phyloseq::distance(ps_rectal.prop, method = "bray")
+ord.nmds.bray_rectal <- ordinate(ps_rectal.prop, method="NMDS", distance="bray")
+
+NMDS_df_rectal <- as.data.frame(ord.nmds.bray_rectal$points)
+rectal_dataset$NMDS1 <- NMDS_df_rectal$MDS1
+rectal_dataset$NMDS2 <- NMDS_df_rectal$MDS2
+```
+
+* Plot
+```{r}
+p_ord_NMDS_rectal <- ggplot(rectal_dataset, aes(NMDS1, NMDS2, color = infant, shape = age_group)) +
+  geom_point() +
+  theme_classic() + 
+  scale_color_manual(name = "Life stage", labels = c("infant", "non-infant"), values = c("cornflowerblue", "purple")) + 
+  scale_shape_manual(name = "Age group", values = c(16, 18, 0, 1, 17)) + 
+  ggtitle(label = "Rectal") + 
+  theme(plot.title = element_text(face = "bold"))
+p_ord_NMDS_rectal
+```
+
+
+##### PCoA (alternative) - age_group & infant
+
+* Compute:
+```{r, results='hide'}
+# Create function geo means for Variance Stabilizing Transformation
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+
+# Variance Stabilizing Transformation
+test.phyloseq.dds_rectal<-phyloseq_to_deseq2(ps_rectal, ~age_group) #age_group
+test.phyloseq.dds_rectal = estimateSizeFactors(test.phyloseq.dds_rectal, geoMeans = apply(counts(test.phyloseq.dds_rectal), 1, gm_mean))
+vst.blind_rectal <- DESeq2::varianceStabilizingTransformation(test.phyloseq.dds_rectal, blind=TRUE)
+vst.blind.Mat_rectal <- SummarizedExperiment::assay(vst.blind_rectal) # Extract transformed OTU table
+vst.blind.Mat_rectal<-t(vst.blind.Mat_rectal)
+vst.blind.Mat_rectal[which(vst.blind.Mat_rectal<0)]<-0
+dists_rectal <- dist(t(assay(vst.blind_rectal)))
+
+# Computing Bray-Curtis Dissimilarities and PCoA
+comm.vst.blind.Mat_rectal <- vegdist(vst.blind.Mat_rectal, "bray")
+PCoA.comm.vst.blind.Mat_rectal<-capscale(comm.vst.blind.Mat_rectal~1,distance="bray")
+PCoA.comm.vst.blind.Mat_rectal$CA$eig[1:3]/sum(PCoA.comm.vst.blind.Mat_rectal$CA$eig)
+PCoA.comm.vst.blind.Mat_rectal
+eig_rectal <- PCoA.comm.vst.blind.Mat_rectal$CA$eig
+
+# Portion of total variation in community structure explained by each of the main three components
+eig_rectal[1]/sum(abs(eig_rectal)) 
+eig_rectal[2]/sum(abs(eig_rectal)) 
+eig_rectal[3]/sum(abs(eig_rectal)) 
+
+row.names(rectal_dataset)==row.names(scores(PCoA.comm.vst.blind.Mat_rectal)$sites)
+rectal_dataset$PCoA1<-scores(PCoA.comm.vst.blind.Mat_rectal)$sites[,1]
+rectal_dataset$PCoA2<-scores(PCoA.comm.vst.blind.Mat_rectal)$sites[,2]
+```
+
+* Plot
+
+##### PCA of rectal samples colored by age group:
+```{r}
+PCA_rectal_age_group <- qplot(PCoA1, PCoA2, xlab="PCoA1", ylab="PCoA2", color=age_group, data=(rectal_dataset)) + theme_classic() #age_group
+PCA_rectal_age_group
+```
+
+##### PCA of rectal samples colored by infant vs non-infant:
+```{r}
+rectal_dataset$infant <- factor(rectal_dataset$infant, levels = c("Yes", "No"))
+
+PCA_rectal_infant <- qplot(PCoA1, PCoA2, xlab="PCoA1", ylab="PCoA2", color=infant, data=(rectal_dataset)) #infant
+
+PCA_rectal_infant <- PCA_rectal_infant + theme_classic() + scale_color_manual(name = "Infant", values = c("cornflowerblue", "purple"))
+
+PCA_rectal_infant
+```
+
+
+#### PERMANOVA
+
+Most of the variance is explained by age_group (model 2): 11.84%
+```{r}
+# With DESeq distances
+permanova.age_group<-adonis(comm.vst.blind.Mat_rectal ~ age_group + sex, data=rectal_dataset, permutations = 9999)
+permanova.age_group$aov.tab
+
+# With Bray-Curtis distances (used in NMDS plot)
+permanova.age_group<-adonis(bray_rectal ~ age_group + sex, data=rectal_dataset, permutations = 9999)
+permanova.age_group$aov.tab
+```
+
+* Pairwise post-hoc tests - Is there one (or more) age group(s) that is/are driving the differences?
+```{r}
+pairwise.adonis(bray_rectal, rectal_dataset$age_group)
+```
+
+### Agglomerate before relative and differential abundance tests
+* agglomerate at the genus level
+
+```{r}
+ps_rectal_glom <- tax_glom(ps_rectal, "Genus", NArm = FALSE)
+ps_rectal_glom
+```
+
+Save phyloseq object as RDS for easy loading for future analyses
+*Make separate folder to keep things organized
+```{r}
+saveRDS(ps_rectal_glom, "./PhyloseqObjects/ps_rectal_glom.rds")
+```
+
+
+#### Top ASVs in rectal community
+
+* Compute:
+```{r top otus, results='hide', message='hide'}
+# comparison at genus level with agglomerated ps object
+rectal_comm<-as.matrix(t(otu_table(ps_rectal_glom, taxa_are_rows=FALSE)))
+
+dim(rectal_comm) #182  103
+rel_abun_rectal<-sweep(rectal_comm, 2, apply(rectal_comm,2,sum), `/`)
+dim(rel_abun_rectal) #182  103
+apply(rel_abun_rectal,2,sum)
+dim(rel_abun_rectal)[1]->t
+order(apply(rel_abun_rectal,1,sum))[(t-9):t]
+top10_asvs_rectal<-names(apply(rel_abun_rectal,1,sum)[order(apply(rel_abun_rectal,1,sum))[(t-9):t]])
+
+taxa_rectal_glom <- data.frame(tax_table(ps_rectal_glom))
+taxa_rectal_glom[top10_asvs_rectal,]->top10_taxa_rectal
+row.names(top10_taxa_rectal)<-c(length(row.names(top10_taxa_rectal)):1)
+paste("asv_",row.names(top10_taxa_rectal),sep="")->row.names(top10_taxa_rectal)
+
+# Test for changes in relative abundance in dominant taxa
+rel_abun_top10_asvs_rectal<-rel_abun_rectal[top10_asvs_rectal,]
+row.names(rel_abun_top10_asvs_rectal)<-row.names(top10_taxa_rectal)
+rel_abun_top10_asvs_rectal<-t(rel_abun_top10_asvs_rectal)
+rel_abun_top10_asvs_rectal<-as.data.frame(rel_abun_top10_asvs_rectal)
+rel_abun_top10_asvs_rectal$sample_ID<-row.names(rel_abun_top10_asvs_rectal)
+
+rectal_dataset$age_group[as.factor(row.names(rel_abun_top10_asvs_rectal))]->rel_abun_top10_asvs_rectal$age_group
+
+rectal_dataset$infant[as.factor(row.names(rel_abun_top10_asvs_rectal))]->rel_abun_top10_asvs_rectal$infant
+
+rectal_dataset$old[as.factor(row.names(rel_abun_top10_asvs_rectal))]->rel_abun_top10_asvs_rectal$old
+
+rectal_dataset$age[as.factor(row.names(rel_abun_top10_asvs_rectal))]->rel_abun_top10_asvs_rectal$age
+
+#transform data to work with ggplot boxplots
+melt_rel_abun_top10_asvs_rectal<-melt(rel_abun_top10_asvs_rectal, id.vars = c("sample_ID","age_group","infant","old","age"))
+
+#wilcoxon for relative abundance differences by infant
+wilcoxon_rectal <- c()
+
+for (i in 1:10){
+  print(colnames(rel_abun_top10_asvs_rectal[i]))
+  print(wilcox.test(rel_abun_top10_asvs_rectal[,i] ~ infant, data=rel_abun_top10_asvs_rectal))
+  wilcoxon_rectal <- c(wilcoxon_rectal, wilcox.test(rel_abun_top10_asvs_rectal[,i] ~ infant, data=rel_abun_top10_asvs_rectal)$p.value)
+}
+
+p.adjust(wilcoxon_rectal, method = "fdr", n = length(wilcoxon_rectal))
+
+#Another method
+compare_means(c(asv_10, asv_9, asv_8, asv_7, asv_6, asv_5, asv_4, asv_3, asv_2, asv_1) ~ infant, rel_abun_top10_asvs_rectal, method = "wilcox.test", p.adjust.method = "fdr")
+```
+
+##### Print top 10 ASVs for rectal samples:
+```{r}
+top10_taxa_rectal
+```
+
+##### Plot variation in relative abundance across age groups for top 10 ASVs
+```{r}
+# better labels
+asv_labels_rectal <- c("Ruminococcus 1", "Prevotellaceae\ngen.", "Treponema 2", "Lachnospiraceae\ngen.", "Alloprevotella", "Ruminococcaceae\nUCG-005", "Rikenellaceae\nRC9_gut_group", "Lactobacillus", "Helicobacter", "Prevotella 9")
+
+# Graph for top 10 asvs
+p_top10_rectal<-ggplot(melt_rel_abun_top10_asvs_rectal, aes(variable, value*100, fill= age_group))+theme_classic()+
+  geom_boxplot(alpha=0.8, outlier.size = 0.5)+
+  xlab(NULL)+ylab("Relative abundance (%)")+
+  theme(axis.text.x  = element_text(size = 8, face = "italic", color="black", angle=-50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold"),
+        axis.title.y  = element_text(size=10, color="black")) + 
+  ylim(0,20) +
+  scale_fill_manual(name="Age group",values=c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  stat_compare_means(label = "p.signif", hide.ns = TRUE) + 
+  scale_x_discrete(labels = asv_labels_rectal) +
+  ggtitle(label = "Rectal")
+p_top10_rectal
+```
+
+##### Plot relative abundances of top 10 ASVs with age as continuous variable 
+```{r}
+ggplot(melt_rel_abun_top10_asvs_rectal, aes(age, value*100)) + 
+  #geom_jitter() + 
+  geom_smooth() + 
+  facet_wrap(~variable, scales = "free_y")
+```
+
+
+
+##### Plot variation in relative abundance for infants and others for top 10 ASVs
+```{r}
+# Graph for top 10 asvs
+p_top10_rectal_inf<-ggplot(melt_rel_abun_top10_asvs_rectal, aes(variable, value*100, fill= infant))+ theme_classic()+
+  geom_boxplot(alpha=0.6, outlier.size = 0.5)+
+  xlab(NULL)+ylab("Relative abundance (%)")+
+  theme(axis.text.x  = element_text(face = "italic", size = 8, color="black", angle=-50, hjust = 0, vjust=0.5),
+        plot.title  = element_text(face = "bold"),
+        axis.title.y  = element_text(size=10, color="black")) + 
+  scale_fill_manual(name="Life stage", labels = c("infant", "non-infant"), values=c("cornflowerblue","purple")) +
+  stat_compare_means(label = "p.signif", hide.ns = TRUE) + 
+  scale_x_discrete(labels = asv_labels_rectal) +
+  ylim(0,20) + 
+  ggtitle(label = "Rectal")
+p_top10_rectal_inf
+```
+
+##### Plot variation in relative abundance for old individuals and others for top 10 ASVs
+```{r}
+# Graph for top 10 asvs
+p_top10_rectal_old<-ggplot(melt_rel_abun_top10_asvs_rectal, aes(variable, value*100, fill= old))+theme_classic()+
+  geom_boxplot(alpha=0.5, outlier.size = 0.5)+
+  xlab("")+ylab("Relative abundance (%)")+
+  theme(axis.text.x  = element_text(face = "italic", size = 8, color="black", angle=-50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold")) +
+  ylim(0,20) +
+  scale_fill_manual(name="Old",values=c("#AF6125", "#F4E3C7")) +
+  scale_x_discrete(labels = asv_labels_rectal) +
+  stat_compare_means(label = "p.signif", hide.ns = TRUE) + 
+  ggtitle(label = "Rectal")
+p_top10_rectal_old
+```
+
+#### Phylum-level relative abundance 
+
+* Relative abundance of Firmicutes and Proteobacteria and Firmicutes/Bacteriodetes ratio across age groups
+```{r}
+ps_rectal_phylum_glom <- tax_glom(ps_rectal, taxrank = "Phylum")
+ps_rectal_phylum_rel <- transform_sample_counts(ps_rectal_phylum_glom, function(otu) otu/sum(otu))
+
+rel_abun_rectal_phyla <- as.matrix(t(otu_table(ps_rectal_phylum_rel, taxa_are_rows=FALSE)))
+phyla_rectal<-taxa[row.names(rel_abun_rectal_phyla),]
+phyla_rectal <- select(phyla_rectal, Phylum)
+
+row.names(rel_abun_rectal_phyla)<-phyla_rectal$Phylum
+rel_abun_rectal_phyla<-t(rel_abun_rectal_phyla)
+rel_abun_rectal_phyla<-as.data.frame(rel_abun_rectal_phyla)
+rel_abun_rectal_phyla$sample_ID<-row.names(rel_abun_rectal_phyla)
+
+rectal_dataset$age_group[as.factor(row.names(rel_abun_rectal_phyla))]->rel_abun_rectal_phyla$age_group
+
+melt_rel_abun_rectal_phyla<-melt(rel_abun_rectal_phyla, id.vars = c("sample_ID","age_group"))
+```
+
+Plot relative abundance of Firmicutes across age
+```{r}
+p_Firmicutes_age <- ggplot(subset(melt_rel_abun_rectal_phyla, melt_rel_abun_rectal_phyla$variable == "Firmicutes"), aes(age_group, value*100, fill= age_group))+theme_classic()+
+  geom_boxplot(alpha=0.8)+
+  xlab("Age group")+ylab("Relative abundance (%)")+
+  theme(axis.text.x  = element_text(color="black"),
+        plot.title = element_text(face = "bold")) +
+  scale_fill_manual(name="Age group",values=c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  stat_compare_means() + 
+  guides(fill = F) +
+  ggtitle(label = "Firmicutes")
+
+p_Firmicutes_age
+```
+
+Plot relative abundance of Proteobacteria across age
+```{r}
+p_Proteobacteria_age <- ggplot(subset(melt_rel_abun_rectal_phyla, melt_rel_abun_rectal_phyla$variable == "Proteobacteria"), aes(age_group, value*100, fill= age_group))+theme_classic()+
+  geom_boxplot(alpha=0.8)+
+  xlab("Age group")+ylab("Relative abundance (%)")+
+  theme(axis.text.x  = element_text(color="black"),
+        plot.title = element_text(face = "bold")) +
+  scale_fill_manual(name="Age group",values=c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  stat_compare_means() + 
+  guides(fill = F) +
+  ggtitle(label = "Proteobacteria")
+
+p_Proteobacteria_age
+```
+
+Ratio of Firmicutes/Bacteroidetes
+```{r}
+rel_abun_rectal_phyla <- rel_abun_rectal_phyla %>% mutate(ratio = Firmicutes/Bacteroidetes)
+melt_rel_abun_rectal_phyla<-melt(rel_abun_rectal_phyla, id.vars = c("sample_ID","age_group"))
+```
+Plot
+```{r}
+p_ratio_age <- ggplot(subset(melt_rel_abun_rectal_phyla, melt_rel_abun_rectal_phyla$variable == "ratio"), aes(age_group, value, fill= age_group))+theme_classic()+
+  geom_boxplot(alpha=0.8)+
+  xlab("Age group")+ylab("Ratio (Firmicutes/Bacteroidetes)")+
+  theme(axis.text.x  = element_text(color="black"),
+        plot.title = element_text(face = "bold")) +
+  scale_fill_manual(name="Age group",values=c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  guides(fill = F) +
+  stat_compare_means() + 
+  ggtitle(label = "Firmicutes/Bacteroidetes")
+
+p_ratio_age
+```
+
+Combo Figure
+```{r}
+p_phyla_combo <- ggarrange(p_Proteobacteria_age, p_Firmicutes_age, p_ratio_age, nrow = 1, labels = "auto")
+
+ggsave("./Figures/RelAbundance_phyla_combo.pdf", p_phyla_combo, height = 4, width = 11, useDingbats = FALSE)
+```
+
+### DIFFERENTIAL ABUNDANCE RECTAL SAMPLES
+
+* Compute differentially abundant taxa in different age groups:
+```{r, results='hide'}
+#transform phyloseq object to deseq object
+rectal.ddseq = phyloseq_to_deseq2(ps_rectal_glom, ~age_group)
+
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object (replaces 0s with 1s, I think)
+geoMeans = apply(counts(rectal.ddseq), 1, gm_mean)
+rectal.ddseq = estimateSizeFactors(rectal.ddseq, geoMeans = geoMeans)
+rectal.ddseq = DESeq(rectal.ddseq, test="LRT", reduced = ~1)
+```
+
+* Create a table of the results of the tests
+```{r, results='hide'}
+alpha = 0.01
+
+res.rectal1 = results(rectal.ddseq, contrast = c("age_group", "<1", "1-4"))
+sigtab.rectal1 = res.rectal1[which(res.rectal1$padj < alpha), ]
+sigtab.rectal1 = cbind(as(sigtab.rectal1, "data.frame"), as(tax_table(ps_rectal_glom)[rownames(sigtab.rectal1), ], "matrix"))
+
+res.rectal2 = results(rectal.ddseq, contrast = c("age_group", "1-4", "5-9"))
+sigtab.rectal2 = res.rectal2[which(res.rectal2$padj < alpha), ]
+sigtab.rectal2 = cbind(as(sigtab.rectal2, "data.frame"), as(tax_table(ps_rectal_glom)[rownames(sigtab.rectal2), ], "matrix"))
+
+res.rectal3 = results(rectal.ddseq, contrast = c("age_group", "5-9", "10-14"))
+sigtab.rectal3 = res.rectal3[which(res.rectal3$padj < alpha), ]
+sigtab.rectal3 = cbind(as(sigtab.rectal3, "data.frame"), as(tax_table(ps_rectal_glom)[rownames(sigtab.rectal3), ], "matrix"))
+
+res.rectal4 = results(rectal.ddseq, contrast = c("age_group", "10-14", "≥15"))
+sigtab.rectal4 = res.rectal4[which(res.rectal4$padj < alpha), ]
+sigtab.rectal4 = cbind(as(sigtab.rectal4, "data.frame"), as(tax_table(ps_rectal_glom)[rownames(sigtab.rectal4), ], "matrix"))
+
+
+# replace Genus names with numbers with clean name to make figure less messy
+levels(sigtab.rectal1$Genus) <- c(levels(sigtab.rectal1$Genus), "Ruminococcaceae gen.", "Prevotellaceae gen.", "Bacteroidales fam.", "Bacteroidales p-2534-18B5 gut group gen.", "Betaproteobacteriales fam.", "Clostridiales fam.")
+sigtab.rectal1$Genus[grep("Prevotellaceae_",sigtab.rectal1$Genus)] = "Prevotellaceae gen."
+sigtab.rectal1$Genus[grep("Ruminococcaceae_",sigtab.rectal1$Genus)] = "Ruminococcaceae gen."
+sigtab.rectal1$Genus[grep("374.10",sigtab.rectal1$baseMean)] = "Bacteroidales fam."
+sigtab.rectal1$Genus[grep("p-2534-18B5",sigtab.rectal1$Family)] = "Bacteroidales p-2534-18B5 gut group gen."
+sigtab.rectal1$Genus[grep("Betaproteobacter",sigtab.rectal1$Order)] = "Betaproteobacteriales fam."
+sigtab.rectal1$Genus[grep("63.23",sigtab.rectal1$baseMean)] = "Clostridiales fam."
+#head(sigtab.rectal)
+```
+* info about analysis
+
+Number of taxa that are differentially expressed - 35
+```{r}
+dim(sigtab.rectal4)
+mcols(res.rectal4, use.names = TRUE)
+```
+
+#### logfold change of differentially abundant taxa in infant macaques
+```{r}
+theme_set(theme_classic())
+
+#subset data to only keep OTUs with more than +2 or -2 log2FoldChange
+sigtab.rectal1 <- subset(sigtab.rectal1, sigtab.rectal1$log2FoldChange <= -2 | sigtab.rectal1$log2FoldChange >= 2)
+sigtab.rectal2 <- subset(sigtab.rectal2, sigtab.rectal2$log2FoldChange <= -2 | sigtab.rectal2$log2FoldChange >= 2)
+sigtab.rectal3 <- subset(sigtab.rectal3, sigtab.rectal3$log2FoldChange <= -2 | sigtab.rectal3$log2FoldChange >= 2)
+sigtab.rectal4 <- subset(sigtab.rectal4, sigtab.rectal4$log2FoldChange <= -2 | sigtab.rectal4$log2FoldChange >= 2)
+
+# Phylum order
+x = tapply(sigtab.rectal1$log2FoldChange, sigtab.rectal1$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.rectal1$Phylum = factor(as.character(sigtab.rectal1$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.rectal1$log2FoldChange, sigtab.rectal1$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.rectal1$Genus = factor(as.character(sigtab.rectal1$Genus), levels=names(x))
+
+# Phylum order
+x = tapply(sigtab.rectal2$log2FoldChange, sigtab.rectal2$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.rectal2$Phylum = factor(as.character(sigtab.rectal2$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.rectal2$log2FoldChange, sigtab.rectal2$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.rectal2$Genus = factor(as.character(sigtab.rectal2$Genus), levels=names(x))
+
+# Phylum order
+x = tapply(sigtab.rectal3$log2FoldChange, sigtab.rectal3$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.rectal3$Phylum = factor(as.character(sigtab.rectal3$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.rectal3$log2FoldChange, sigtab.rectal3$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.rectal3$Genus = factor(as.character(sigtab.rectal3$Genus), levels=names(x))
+
+# Phylum order
+x = tapply(sigtab.rectal4$log2FoldChange, sigtab.rectal4$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.rectal4$Phylum = factor(as.character(sigtab.rectal4$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.rectal4$log2FoldChange, sigtab.rectal4$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.rectal4$Genus = factor(as.character(sigtab.rectal4$Genus), levels=names(x))
+
+
+p_rectal_DiffExp1 <- ggplot(sigtab.rectal1, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "Rectal", subtitle = "<1 vs. 1-4 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top",
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8)) + 
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top", )) +
+  xlab(NULL) + 
+  scale_x_discrete(labels = wrap_format(26)) +
+  scale_color_manual(name = "Phylum", values = c("#A50026", "#F46D43", "#FEE090", "#313695", "#ABD9E9", "#74ADD1", "#4575B4", "#D73027", "#E0F3F8"))
+
+p_rectal_DiffExp2 <- ggplot(sigtab.rectal2, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "", subtitle = "1-4 vs. 5-9 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top",
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8)) + 
+    scale_x_discrete(labels = c("Ureaplasma","Bifidobacterium", "Betaproteobacteriales\nfam.")) +
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top")) +
+  xlab(NULL) + 
+  scale_color_manual(name = "Phylum", values = c("#F46D43", "#A50026", "#4575B4", "#D73027", "#FDAE61", "#313695", "#E0F3F8", "#ABD9E9", "#74ADD1", "#4575B4")) 
+
+p_rectal_DiffExp3 <- ggplot(sigtab.rectal3, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "",subtitle = "5-9 vs. 10-14 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top",
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8)) + 
+  scale_x_discrete(labels = c("Betaproteobacteriales\nfam.")) +
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top")) +
+  xlab(NULL) + 
+  scale_color_manual(name = "Phylum", values = c("#4575B4", "#A50026", "#F46D43", "#FDAE61", "#313695", "#E0F3F8", "#ABD9E9", "#74ADD1", "#4575B4")) 
+
+p_rectal_DiffExp4 <- ggplot(sigtab.rectal4, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "", subtitle = "10-14 vs. ≥15 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top",
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8)) + 
+  scale_x_discrete(labels = c("Bifidobacterium", "Betaproteobacteriales\nfam.")) +
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top")) +
+  xlab(NULL) + 
+  scale_color_manual(name = "Phylum", values = c("#A50026", "#4575B4", "#F46D43", "#FDAE61", "#313695", "#E0F3F8", "#ABD9E9", "#74ADD1", "#4575B4")) 
+
+p_rectal_DiffExp1
+p_rectal_DiffExp2
+p_rectal_DiffExp3
+p_rectal_DiffExp4
+```
+
+Create objects containing only legends for arranging figures later:
+```{r}
+legend_DiffExp <- ggplot(sigtab.rectal1, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "Rectal", subtitle = "<1 vs. 1-4 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold")) + 
+  guides(size = "none") +
+  xlab(NULL) + 
+  scale_color_manual(name = "Phylum", values = c("#A50026", "#F46D43", "#FEE090", "#313695", "#ABD9E9", "#74ADD1", "#4575B4", "#D73027", "#E0F3F8"))
+
+legend_p_rectal_DiffExp <- ggplot(sigtab.rectal2, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "Rectal", subtitle = "1-4 vs. 5-9 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold")) + 
+  guides(size = "none") +
+  xlab(NULL) + 
+  scale_color_manual(name = "Phylum", values = c("#F46D43", "#A50026", "#4575B4", "#D73027", "#FDAE61", "#313695", "#E0F3F8", "#ABD9E9", "#74ADD1", "#4575B4")) 
+
+legend_DiffExp <- get_legend(legend_DiffExp)
+legend_p_rectal_DiffExp <- get_legend(legend_p_rectal_DiffExp)
+```
+
+#### Differential abundance of candidate taxa (based on human and mouse studies)
+
+* Created variable in dataframe to compare old (≥15 years old) versus young individuals. But maybe other age cut-off should be used? 
+
+* Prune dataset
+```{r}
+ps_rectal_pruned = subset_taxa(ps_rectal, Phylum=="Actinobacteria" | Phylum=="Proteobacteria" | Family=="Rikenellaceae" | Family=="Lachnospiraceae" | Family=="Clostridiaceae_1")
+```
+
+* Compute differential abundance of candidate taxa in old macaques
+```{r, eval=FALSE}
+#transform phyloseq object to deseq object
+rectal_pruned.ddseq = phyloseq_to_deseq2(ps_rectal_pruned, ~old)
+
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object (replaces 0s with 1s, I think)
+geoMeans = apply(counts(rectal_pruned.ddseq), 1, gm_mean)
+rectal_pruned.ddseq = estimateSizeFactors(rectal_pruned.ddseq, geoMeans = geoMeans)
+rectal_pruned.ddseq = DESeq(rectal_pruned.ddseq, test="Wald", fitType="local")
+```
+
+* creates a table of the results of the tests
+```{r, eval=FALSE}
+res.rectal_pruned = results(rectal_pruned.ddseq, cooksCutoff = FALSE)
+alpha = 0.01
+sigtab.rectal_pruned = res.rectal_pruned[which(res.rectal_pruned$padj < alpha), ]
+sigtab.rectal_pruned = cbind(as(sigtab.rectal_pruned, "data.frame"), as(tax_table(ps_rectal_pruned)[rownames(sigtab.rectal_pruned), ], "matrix"))
+head(sigtab.rectal_pruned)
+```
+
+* dimensions of table and info about analysis
+```{r, eval=FALSE}
+dim(sigtab.rectal_pruned)
+mcols(res.rectal_pruned, use.names = TRUE)
+```
+
+#### logfold change of differentially abundant taxa in old macaques (from candidate taxa)
+```{r, eval=FALSE}
+theme_set(theme_classic())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab.rectal_pruned$log2FoldChange, sigtab.rectal_pruned$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.rectal_pruned$Phylum = factor(as.character(sigtab.rectal_pruned$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.rectal_pruned$log2FoldChange, sigtab.rectal_pruned$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.rectal_pruned$Genus = factor(as.character(sigtab.rectal_pruned$Genus), levels=names(x))
+
+ggplot(sigtab.rectal_pruned, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + geom_point() + theme(axis.text.x = element_text(angle = -90, hjust = 0, vjust=0.5))
+```
+

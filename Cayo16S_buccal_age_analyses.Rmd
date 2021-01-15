@@ -1,0 +1,881 @@
+---
+title: "Cayo 16S Buccal Analyses"
+output:
+  html_document:
+    code_folding: hide
+---
+
+### BUCCAL SAMPLES SEPARATELY
+
+**Downstream analyses - generate input files with 'dada2Code' markdown first**
+
+* Load libraries
+```{r packages, results='hide'}
+x<-c("ggplot2", "dada2", "vegan", "tidyr","car","DESeq2", "phyloseq","FSA", "lme4", "ggpubr", "reshape2", "decontam", "pairwiseAdonis", "wesanderson", "LaCroixColoR")
+lapply(x, require, character.only = TRUE)
+```
+
+* Load seqtab, otu table, and taxa from dada2 pipeline
+```{r}
+seqtab.nochim <- readRDS("./seqtab.nochim_Cayo16S.rds")
+taxa <- read.csv("./taxaGF.csv", row.names = 1)
+```
+
+* Load metadata
+```{r}
+dataset <- read.csv("./Cayo16S_metadata_Aging_MS.txt",header=T,row.names = 1)
+quant_data <- read.delim("./Cayo16S_copy_number_data.tsv", header = T)
+quant_data <- quant_data$copy_number
+
+dataset$sample_ID <- rownames(dataset)
+
+dataset <- cbind(dataset, quant_data)
+
+dataset$control <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$sample_type[i]== "negcontrol"){
+    dataset$control[i] <- "Yes"
+  }
+  if (dataset$sample_type[i]== "poscontrol"){
+    dataset$control[i] <- "Yes"
+  }
+}
+
+dataset$age[is.na(dataset$age)] <- -1
+
+dataset$infant <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 0){
+    dataset$infant[i] <- "Yes"
+  }
+}
+
+dataset$age_group <- "<1"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 1| dataset$age[i] == 2| dataset$age[i] == 3 | dataset$age[i] == 4){
+    dataset$age_group[i] <- "1-4"
+  }
+  else if (dataset$age[i] == 5| dataset$age[i] == 6| dataset$age[i] == 7 | dataset$age[i] == 8 | dataset$age[i] == 9){
+    dataset$age_group[i] <- "5-9"
+  }
+  else if (dataset$age[i] == 10 | dataset$age[i] == 11| dataset$age[i] == 12 | dataset$age[i] == 13 | dataset$age[i] == 14){
+    dataset$age_group[i] <- "10-14"
+  }
+  else if (dataset$age[i] == 15| dataset$age[i] >= 15){
+    dataset$age_group[i] <- "≥15"
+  }
+  else if (dataset$age[i] == -1){
+    dataset$age_group[i] <- NA
+  }
+}
+
+dataset$age_group[is.na(dataset$age_group)] <- "other"
+
+dataset$old <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] >= 15){
+    dataset$old[i] <- "Yes"
+  }
+}
+
+dataset[dataset==-1] <- NA
+
+dataset$sex <- as.character(dataset$sex)
+```
+
+
+* Create buccal phyloseq subset and dataset for buccal metadata
+```{r}
+ps <- phyloseq(otu_table(as.matrix(seqtab.nochim), taxa_are_rows = FALSE), 
+               sample_data(dataset), 
+               tax_table(as.matrix(taxa)))
+
+ps_buccal <- subset_samples(ps, sample_type == "buccal" | sample_ID == "NegCtrl5")
+buccal_dataset <- subset(dataset, sample_type=="buccal" | sample_ID == "NegCtrl5")
+```
+
+### Decontamination
+
+#### Inspect Library Sizes
+
+Let’s take a quick first look at the library sizes (i.e. the number of reads) in each sample, as a function of whether that sample was a true positive sample or a negative control:
+
+* All data
+```{r}
+df <- as.data.frame(sample_data(ps)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=control)) + geom_point()
+```
+* buccal only:
+
+```{r}
+df_buccal <- as.data.frame(sample_data(ps_buccal)) # Put sample_data into a ggplot-friendly data.frame
+df_buccal$LibrarySize <- sample_sums(ps_buccal)
+df_buccal <- df_buccal[order(df_buccal$LibrarySize),]
+df_buccal$Index <- seq(nrow(df_buccal))
+ggplot(data=df_buccal, aes(x=Index, y=LibrarySize, color=control)) + geom_point()
+```
+
+#### Identify Contaminants - Frequency
+
+The first contaminant identification method we’ll use is the “frequency” method. In this method, the distribution of the frequency of each sequence feature as a function of the input DNA concentration is used to identify contaminants.
+
+```{r}
+contamdf.freq <- isContaminant(ps_buccal, method="frequency", conc="quant_data")
+head(contamdf.freq)
+```
+
+This calculation has returned a data.frame with several columns, the most important being $p which containts the probability that was used for classifying contaminants, and $contaminant which contains TRUE/FALSE classification values with TRUE indicating that the statistical evidence that the associated sequence feature is a contaminant exceeds the user-settable threshold. As we did not specify the threshold, the default value of threshold = 0.1 was used, and $contaminant=TRUE if $p < 0.1.
+```{r}
+table(contamdf.freq$contaminant)
+head(which(contamdf.freq$contaminant))
+```
+
+In this plot the dashed black line shows the model of a noncontaminant sequence feature for which frequency is expected to be independent of the input DNA concentration. The red line shows the model of a contaminant sequence feature, for which frequency is expected to be inversely proportional to input DNA concentration, as contaminating DNA will make up a larger fraction of the total DNA in samples with very little total DNA. 
+
+```{r}
+plot_frequency(ps_buccal, taxa_names(ps_buccal)[which(contamdf.freq$contaminant)], conc="quant_data") + 
+  xlab("DNA Concentration (qPCR (molecules/ul))")
+```
+
+Remove contaminants and negative control for further analyses:
+```{r}
+ps_buccal <- prune_taxa(!contamdf.freq$contaminant, ps_buccal)
+
+ps_buccal <- subset_samples(ps_buccal, sample_ID != "NegCtrl5")
+buccal_dataset <- subset(buccal_dataset, sample_ID != "NegCtrl5")
+ps_buccal
+```
+
+Remove samples with fewer than 2000 sequences:
+```{r}
+ps_buccal <- prune_samples(sample_sums(ps_buccal)>=2000, ps_buccal)
+buccal_dataset <- subset(buccal_dataset, sample_ID != "MB103963" )
+ps_buccal <- prune_taxa(taxa_sums(ps_buccal) > 0, ps_buccal)
+ps_buccal
+```
+
+
+### Taxonomic Filtering
+create a table of number of features for each Phylum present in the dataset
+```{r}
+rank_names(ps_buccal)
+table(tax_table(ps_buccal)[, "Phylum"], exclude = NULL)
+```
+
+Remove features with NA or ambiguous phylum annotation from dataset:
+```{r}
+ps_buccal <- subset_taxa(ps_buccal, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+ps_buccal
+```
+
+A useful next step is to explore feature prevalence in the dataset, which we will define here as the number of samples in which a taxon appears at least once.
+```{r}
+# Compute prevalence of each feature, store as data.frame
+prevdf = apply(X = otu_table(ps_buccal),
+               MARGIN = ifelse(taxa_are_rows(ps_buccal), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(ps_buccal),
+                    tax_table(ps_buccal))
+```
+
+Are there phyla that are comprised of mostly low-prevalence features? Compute the total and average prevalences of the features in each phylum.
+
+```{r}
+plyr::ddply(prevdf, "Phylum", function(df1){cbind(mean(df1$Prevalence),sum(df1$Prevalence))})
+```
+
+Filter phyla:
+```{r}
+filterPhylabuccal = c("Acidobacteria", "Elusimicrobia", "Gemmatimonadetes", "Rokubacteria", "Cyanobacteria")
+ps_buccal = subset_taxa(ps_buccal, !Phylum %in% filterPhylabuccal)
+ps_buccal
+```
+
+#### Prevalence Filtering
+```{r}
+# Subset to the remaining phyla
+prevdf1 = subset(prevdf, Phylum %in% get_taxa_unique(ps_buccal, "Phylum"))
+ggplot(prevdf1, aes(TotalAbundance, Prevalence / nsamples(ps_buccal),color=Phylum)) +
+  # Include a guess for parameter
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 2) +  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+```
+
+Set prevalence threshold to ten percent and remove taxa that occur in less than ten percent of buccal samples:
+```{r}
+# Define prevalence threshold as 10% of total samples
+prevalenceThresholdbuccal = 0.1 * nsamples(ps_buccal)
+prevalenceThresholdbuccal
+```
+
+```{r}
+# Execute prevalence filter, using `prune_taxa()` function
+keepTaxabuccal = rownames(prevdf1)[(prevdf1$Prevalence >= 10)]
+ps_buccal = prune_taxa(keepTaxabuccal, ps_buccal)
+ps_buccal
+```
+
+Save phyloseq object as RDS for future analyses without need for re-doing filtering:
+```{r}
+saveRDS(ps_buccal, "./PhyloseqObjects/ps_buccal.rds")
+```
+
+Read in phyloseq object, if it's not in environment
+```{r}
+ps_buccal <- readRDS("./PhyloseqObjects/ps_buccal.rds")
+buccal_dataset <- read.csv("./PiCrust2_in/buccal_dataset_FunkyTax.csv", header = TRUE, row.names = 1)
+```
+
+
+##### Obtaining files for PiCrust2
+
+* Rename ASVs with short name, instead of full sequence
+```{r, eval=FALSE}
+buccal_dna <- Biostrings::DNAStringSet(taxa_names(ps_buccal))
+names(buccal_dna) <- taxa_names(ps_buccal)
+ps_buccal_short <- merge_phyloseq(ps_buccal, buccal_dna)
+taxa_names(ps_buccal_short) <- paste0("ASV", seq(ntaxa(ps_buccal_short)))
+ps_buccal_short
+```
+
+*Save fasta file from phyloseq object
+*Save in separate folder to keep things organized
+```{r, eval=FALSE}
+Biostrings::writeXStringSet(refseq(ps_buccal_short), "./PiCrust2_in/buccal_seqs.fasta")
+```
+
+*Save otu table as csv with taxa as rows
+```{r, eval=FALSE}
+# Extract abundance matrix from the phyloseq object
+buccal_otu = as(otu_table(ps_buccal_short), "matrix")
+# transpose if necessary
+buccal_otu <- t(buccal_otu)
+# Coerce to data.frame
+buccal_otu_df = as.data.frame(buccal_otu)
+write.table(buccal_otu_df, "./PiCrust2_in/buccal_otu.tsv", sep = "\t", quote = FALSE)
+```
+
+
+### 1. Obtaining basic stats to report in methods.
+
+Number of ASVs per group and mean, min, and max per sample in the buccal group
+
+Per sample number of ASVs:
+```{r per group}
+sub<-which(dataset$sample_type=="buccal")
+pa_matrix<-decostand(seqtab.nochim,method="pa")
+apply(pa_matrix[sub,],1,sum) # view per sample number of ASVs
+```
+
+Number of samples that include the ASVs:
+```{r}
+hist(apply(pa_matrix[sub,],2,sum)) # nb of samples that include the ASVs
+```
+
+```{r, results='hide'}
+stem(apply(pa_matrix[sub,],2,sum)) # nb of samples that include the ASVs
+```
+
+Min, mean, and max number of ASVs per sample:
+```{r}
+summary(apply(pa_matrix[which(dataset$sample_type == "buccal"),],1,sum)) # get mean, min, and max of number of ASVs per sample
+```
+
+Histogram of distribution of number of ASVs per sample:
+```{r}
+hist(apply(pa_matrix[sub,],1,sum)) # see histogram of nb of ASVs per sample distribution
+```
+
+
+### DIVERSITY
+#### Alpha-diversity (Shannon) and species richness (Chao1)
+
+* CHAO1 and Shannon's Index
+
+```{r computation}
+adiv<-estimate_richness(ps,measures=c("Observed","Shannon","Chao1"))
+adiv_buccal <- subset(adiv, rownames(adiv) %in% rownames(buccal_dataset))
+buccal_dataset$alphadiv<-adiv_buccal$Shannon
+hist(buccal_dataset$alphadiv)
+buccal_dataset$chao1<-adiv_buccal$Chao1
+hist(buccal_dataset$chao1)
+buccal_dataset$evenness<-adiv_buccal$Shannon/log(adiv_buccal$Observed)
+```
+
+###### Boxplots
+
+* Change order of x-axis for boxplots:
+```{r}
+buccal_dataset$age_group <- factor(buccal_dataset$age_group, levels = c("<1", "1-4", "5-9", "10-14", "≥15"))
+buccal_dataset$infant <- factor(buccal_dataset$infant, levels = c("Yes", "No"))
+```
+
+* CHAO1 by age groups
+
+```{r}
+p_age_chao_buccal<-ggplot(buccal_dataset, aes(age_group, chao1,fill=age_group, color=age_group)) +
+  theme_classic()+
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("Age Group")+ylab("SPECIES RICHNESS (Chao1)")+
+  theme(axis.text.x  = element_text(size=12, color="black"),
+        axis.text.y  = element_text(size=12, color="black"),
+        axis.title.x  = element_text(size=14, color="black",face="bold"),
+        axis.title.y  = element_text(size=14, color="black",face="bold"))+
+  scale_fill_manual(name="Age group",values=c("blue","dodgerblue","purple","red", "cornflowerblue", "coral" )) +
+  scale_color_manual(name="Age group",values=c("black","black","black","black","black","black")) +
+  guides(fill=F,color=F) + stat_compare_means()
+p_age_chao_buccal
+```
+
+* Shannon's Index by age groups
+
+```{r}
+p_age_shannon_buccal<-ggplot(buccal_dataset, aes(age_group, alphadiv,fill=age_group)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.8, outlier.shape = NA) +
+  geom_jitter(width=0.1) +
+  xlab("Age group")+ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Age group",values=c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  guides(fill=F) + 
+  stat_compare_means() + 
+  ggtitle(label = "Oral") + 
+  theme(plot.title = element_text(face = "bold"))
+p_age_shannon_buccal 
+```
+
+* CHAO1 by infant yes or no
+
+```{r}
+p1<-ggplot(buccal_dataset, aes(infant, chao1,fill=infant, color=infant)) +
+  theme_bw()+
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("Infant")+ylab("SPECIES RICHNESS (Chao1)")+
+  theme(axis.text.x  = element_text(size=12, color="black"),
+        axis.text.y  = element_text(size=12, color="black"),
+        axis.title.x  = element_text(size=14, color="black",face="bold"),
+        axis.title.y  = element_text(size=14, color="black",face="bold"))+
+  guides(fill=F,color=F) + stat_compare_means()
+p1
+```
+
+* Shannon's Index by infant yes or no
+
+```{r}
+p_infant_shannon_buccal <-ggplot(buccal_dataset, aes(infant, alphadiv, fill=infant)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) +
+  geom_jitter(width=0.1, height = 0) +
+  ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Life stage", labels = c("infant", "non-infant"), values=c("cornflowerblue","purple")) +
+  scale_shape_manual(name= "Sex", labels = c("female", "male"), values = c(15, 0)) +
+  stat_compare_means() + 
+  scale_x_discrete(labels = c("infant", "non-infant")) +
+  ggtitle(label = "Oral") + 
+  theme(plot.title = element_text(face = "bold")) +
+  ylim(1.5, 5.5) +
+  guides(fill = F) +
+  xlab("Life stage")
+p_infant_shannon_buccal 
+```
+
+* CHAO1 by old yes or no
+
+```{r}
+p1<-ggplot(buccal_dataset, aes(old, chao1,fill=old, color=old)) +
+  theme_bw()+
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("Old")+ylab("SPECIES RICHNESS (Chao1)")+
+  theme(axis.text.x  = element_text(size=12, color="black"),
+        axis.text.y  = element_text(size=12, color="black"),
+        axis.title.x  = element_text(size=14, color="black",face="bold"),
+        axis.title.y  = element_text(size=14, color="black",face="bold"))+
+  guides(fill=F,color=F) + stat_compare_means()
+p1
+```
+
+* Shannon's Index by old yes or no
+
+```{r}
+p_old_shannon_buccal<-ggplot(buccal_dataset, aes(old, alphadiv,fill=old)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) +
+  geom_jitter(width=0.1) +
+  xlab("15 years or older") +
+  ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Old",values=c("#AF6125", "#F4E3C7")) +
+  guides(fill=F) + 
+  stat_compare_means() + 
+  ggtitle(label = "Oral") + 
+  theme(plot.title = element_text(face = "bold")) +
+  ylim(1.5,5.5)
+p_old_shannon_buccal
+```
+
+* Shannon's Index by sex
+```{r}
+p3_sex_buccal<-ggplot(buccal_dataset, aes(sex, alphadiv,fill=sex)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) +
+  geom_jitter(width=0.1) +
+  xlab("Sex")+
+  ylab("Alpha-diversity (Shannon Index)") +
+  guides(fill=F) + 
+  stat_compare_means() + 
+  scale_fill_manual(name = "Sex", values = c("#E41A1C", "#377EB8")) +
+  ggtitle(label = "Oral") + 
+  theme(plot.title = element_text(face = "bold")) +
+  ylim(1.5,5.5)
+p3_sex_buccal 
+```
+
+### Ordinations
+
+* Compute distances and ordination (dada2 tutorial)
+```{r}
+# Ordination (from DADA2 tutorial)
+ps_buccal.prop <- transform_sample_counts(ps_buccal, function(otu) otu/sum(otu))
+
+bray_buccal <- phyloseq::distance(ps_buccal.prop, method = "bray")
+ord.nmds.bray_buccal <- ordinate(ps_buccal.prop, method="NMDS", distance="bray")
+ord.pcoa.bray_buccal <- ordinate(ps_buccal.prop, method="PCoA", distance="bray")
+
+NMDS_df_buccal <- as.data.frame(ord.nmds.bray_buccal$points)
+buccal_dataset$NMDS1 <- NMDS_df_buccal$MDS1
+buccal_dataset$NMDS2 <- NMDS_df_buccal$MDS2
+```
+* Plot
+
+###### Plots colored by age_group
+```{r}
+p_ord_NMDS <- plot_ordination(ps_buccal.prop, ord.nmds.bray_buccal, color="age_group", title="Bray NMDS")
+p_ord_PCoA <- plot_ordination(ps_buccal.prop, ord.pcoa.bray_buccal, color="age_group", title="Bray PCoA")
+
+p_ord_PCoA
+p_ord_NMDS
+```
+
+
+* Infants seem to fall out a little, so here are the same plots colored by infant yes or no
+```{r}
+p_ord_NMDS_buccal <- plot_ordination(ps_buccal.prop, ord.nmds.bray_buccal, color="infant", shape = "age_group")
+p_ord_PCoA <- plot_ordination(ps_buccal.prop, ord.pcoa.bray_buccal, color="infant", title="Bray PCoA")
+
+p_ord_NMDS_buccal <- ggplot(buccal_dataset, aes(NMDS1, NMDS2, color = infant, shape = age_group)) + 
+  geom_point() +
+  theme_classic() + 
+  scale_color_manual(name = "Life stage", labels = c("infant", "non-infant"), values = c("cornflowerblue", "purple")) + 
+  scale_shape_manual(name = "Age group", values = c(16, 18, 0, 1, 17)) + 
+  ggtitle(label = "Oral") + 
+  theme(plot.title = element_text(face = "bold"))
+p_ord_NMDS_buccal
+p_ord_PCoA
+```
+
+##### PCoA (alternative) - age_group & infant
+
+* Compute:
+```{r, results='hide'}
+# Create function geo means for Variance Stabilizing Transformation
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+
+# Variance Stabilizing Transformation
+test.phyloseq.dds_buccal<-phyloseq_to_deseq2(ps_buccal, ~age_group) #age_group
+test.phyloseq.dds_buccal = estimateSizeFactors(test.phyloseq.dds_buccal, geoMeans = apply(counts(test.phyloseq.dds_buccal), 1, gm_mean))
+vst.blind_buccal <- DESeq2::varianceStabilizingTransformation(test.phyloseq.dds_buccal, blind=TRUE)
+vst.blind.Mat_buccal <- SummarizedExperiment::assay(vst.blind_buccal) # Extract transformed OTU table
+vst.blind.Mat_buccal<-t(vst.blind.Mat_buccal)
+vst.blind.Mat_buccal[which(vst.blind.Mat_buccal<0)]<-0
+dists_buccal <- dist(t(assay(vst.blind_buccal)))
+
+# Computing Bray-Curtis Dissimilarities and PCoA
+comm.vst.blind.Mat_buccal <- vegdist(vst.blind.Mat_buccal, "bray")
+PCoA.comm.vst.blind.Mat_buccal<-capscale(comm.vst.blind.Mat_buccal~1,distance="bray")
+PCoA.comm.vst.blind.Mat_buccal$CA$eig[1:3]/sum(PCoA.comm.vst.blind.Mat_buccal$CA$eig)
+PCoA.comm.vst.blind.Mat_buccal
+eig_buccal <- PCoA.comm.vst.blind.Mat_buccal$CA$eig
+
+# Portion of total variation in community structure explained by each of the main three components
+eig_buccal[1]/sum(abs(eig_buccal)) 
+eig_buccal[2]/sum(abs(eig_buccal)) 
+eig_buccal[3]/sum(abs(eig_buccal)) 
+
+row.names(buccal_dataset)==row.names(scores(PCoA.comm.vst.blind.Mat_buccal)$sites)
+buccal_dataset$PCoA1<-scores(PCoA.comm.vst.blind.Mat_buccal)$sites[,1]
+buccal_dataset$PCoA2<-scores(PCoA.comm.vst.blind.Mat_buccal)$sites[,2]
+```
+
+* Plot
+
+###### PCA of buccal samples colored by age group:
+```{r}
+PCA_buccal_age_group <- qplot(PCoA1, PCoA2, xlab="PCoA1", ylab="PCoA2", color=age_group, data=(buccal_dataset)) #age_group
+PCA_buccal_age_group + theme_classic() 
+```
+
+###### PCA of buccal samples colored by infant vs non-infant:
+```{r}
+buccal_dataset$infant <- factor(buccal_dataset$infant, levels = c("Yes", "No"))
+
+PCA_buccal_infant <- qplot(PCoA1, PCoA2, xlab="PCoA1", ylab="PCoA2", color=infant, data=(buccal_dataset)) #infant
+PCA_buccal_infant <- PCA_buccal_infant + theme_classic() + scale_color_manual(name = "Infant", values = c("cornflowerblue", "purple"))
+
+PCA_buccal_infant
+```
+
+
+#### PERMANOVA
+
+Age_group (model 2) explains most of the variance: 13.6%
+```{r}
+# With DESeq distances
+permanova.age_group<-adonis(comm.vst.blind.Mat_buccal ~ age_group + sex, data=buccal_dataset, permutations = 9999)
+permanova.age_group$aov.tab
+
+# With Bray-Curtis distances (used in plots)
+permanova.age_group<-adonis(bray_buccal ~ age_group + sex, data=buccal_dataset, permutations = 9999)
+permanova.age_group$aov.tab
+
+permanova.age_group<-adonis(comm.vst.blind.Mat_buccal ~ age_group * sex, data=buccal_dataset, permutations = 9999)
+permanova.age_group$aov.tab
+```
+
+* Pairwise post-hoc tests - Is there one (or more) age group(s) that is/are driving the differences?
+```{r}
+pairwise.adonis(bray_buccal, buccal_dataset$age_group)
+```
+
+
+### Agglomerate before relative and differential abundance tests
+* agglomerate at the genus level
+
+```{r}
+ps_buccal_glom <- tax_glom(ps_buccal, "Genus", NArm = FALSE)
+ps_buccal_glom
+```
+
+Save phyloseq object for easy loading in future analyses:
+```{r}
+saveRDS(ps_buccal_glom, "./PhyloseqObjects/ps_buccal_glom.rds")
+```
+
+Read in phyloseq object for following analyses (if not already loaded)
+```{r}
+ps_buccal_glom <- readRDS("./PhyloseqObjects/ps_buccal_glom.rds")
+```
+
+#### Top ASVs in buccal community
+
+Compute:
+```{r top otus, results='hide'}
+buccal_comm<-as.matrix(t(otu_table(ps_buccal_glom, taxa_are_rows=FALSE)))
+dim(buccal_comm) #83  104
+rel_abun_buccal<-sweep(buccal_comm, 2, apply(buccal_comm,2,sum), `/`)
+dim(rel_abun_buccal) #83  104
+apply(rel_abun_buccal,2,sum)
+dim(rel_abun_buccal)[1]->t
+#apply(rel_abun_buccal,1,sum)
+order(apply(rel_abun_buccal,1,sum))[(t-9):t]
+top10_asvs_buccal<-names(apply(rel_abun_buccal,1,sum)[order(apply(rel_abun_buccal,1,sum))[(t-9):t]])
+
+taxa_buccal_glom <- data.frame(tax_table(ps_buccal_glom))
+taxa_buccal_glom[top10_asvs_buccal,]->top10_taxa_buccal
+row.names(top10_taxa_buccal)<-c(length(row.names(top10_taxa_buccal)):1)
+paste("asv_",row.names(top10_taxa_buccal),sep="")->row.names(top10_taxa_buccal)
+
+# Test for changes in relative abundance in dominant taxa
+rel_abun_top10_asvs_buccal<-rel_abun_buccal[top10_asvs_buccal,]
+row.names(rel_abun_top10_asvs_buccal)<-row.names(top10_taxa_buccal)
+rel_abun_top10_asvs_buccal<-t(rel_abun_top10_asvs_buccal)
+rel_abun_top10_asvs_buccal<-as.data.frame(rel_abun_top10_asvs_buccal)
+rel_abun_top10_asvs_buccal$sample_ID<-row.names(rel_abun_top10_asvs_buccal)
+
+buccal_dataset$age_group[as.factor(row.names(rel_abun_top10_asvs_buccal))]->rel_abun_top10_asvs_buccal$age_group
+
+buccal_dataset$infant[as.factor(row.names(rel_abun_top10_asvs_buccal))]->rel_abun_top10_asvs_buccal$infant
+
+buccal_dataset$old[as.factor(row.names(rel_abun_top10_asvs_buccal))]->rel_abun_top10_asvs_buccal$old
+
+#transform data to work with boxplots
+melt_rel_abun_top10_asvs_buccal<-melt(rel_abun_top10_asvs_buccal)
+
+#wilcoxon for relative abundance differences by infant
+wilcoxon_buccal <- c()
+
+for (i in 1:10){
+  print(colnames(rel_abun_top10_asvs_buccal[i]))
+  print(wilcox.test(rel_abun_top10_asvs_buccal[,i] ~ infant, data=rel_abun_top10_asvs_buccal))
+  wilcoxon_buccal <- c(wilcoxon_buccal, wilcox.test(rel_abun_top10_asvs_buccal[,i] ~ infant, data=rel_abun_top10_asvs_buccal)$p.value)
+}
+
+p.adjust(wilcoxon_buccal, method = "fdr", n = length(wilcoxon_buccal))
+
+#Another method?
+compare_means(c(asv_10, asv_9, asv_8, asv_7, asv_6, asv_5, asv_4, asv_3, asv_2, asv_1) ~ infant, rel_abun_top10_asvs_buccal, method = "wilcox.test", p.adjust.method = "fdr")
+```
+
+###### Print top 10 ASVs for buccal samples:
+```{r}
+top10_taxa_buccal
+```
+
+###### Plot variation in relative abundance across age groups for top 10 ASVs
+```{r}
+# better labels
+asv_labels_buccal <- c("Alloscardovia", "Gemella", "Haemophilus", "Actinobacillus", "Alloprevotella", "Porphyromonas", "Rodentibacter", "Fusobacterium", "Veillonella", "Streptococcus")
+
+# Graph for top 10 asvs
+p_top10_buccal<-ggplot(melt_rel_abun_top10_asvs_buccal, aes(variable, value*100, fill= age_group))+theme_classic()+
+  geom_boxplot(alpha=0.8, outlier.size = 0.5)+
+  xlab(NULL)+ylab("Relative abundance (%)")+
+  theme(axis.text.x  = element_text(face = "italic", size = 8, color="black", angle=-50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold"),
+        axis.title.y = element_text(size = 10)) +
+  ylim(0,40) +
+  scale_fill_manual(name="Age group",values=c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  stat_compare_means(label = "p.signif", hide.ns = TRUE) + 
+  scale_x_discrete(labels = asv_labels_buccal) +
+  ggtitle(label = "Oral")
+  
+p_top10_buccal
+```
+
+###### Plot variation in relative abundance for infants and others for top 10 ASVs
+```{r}
+# Graph for top 10 asvs
+p_top10_buccal_inf<-ggplot(melt_rel_abun_top10_asvs_buccal, aes(variable, value*100, fill= infant)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.5, outlier.size = 0.5)+
+  xlab(NULL)+ylab("Relative abundance (%)")+
+  theme(axis.text.x  = element_text(face = "italic", size = 8, color="black", angle=-50, hjust = 0, vjust=0.5),
+        axis.title.y = element_text(size = 10),
+        plot.title = element_text(face = "bold")) +
+  ylim(0,40) +
+  scale_fill_manual(name="Life stage", labels = c("infant", "non-infant"), values=c("cornflowerblue", "purple")) +
+  stat_compare_means(label = "p.signif", hide.ns = TRUE) + 
+  scale_x_discrete(labels = asv_labels_buccal) +
+  ggtitle(label = "Oral")
+p_top10_buccal_inf
+```
+
+###### Plot variation in relative abundance for old individuals and others for top 10 ASVs
+```{r}
+# Graph for top 10 asvs
+p_top10_buccal_old<-ggplot(melt_rel_abun_top10_asvs_buccal, aes(variable, value*100, fill= old))+theme_classic()+
+  geom_boxplot(alpha=0.5, outlier.size = 0.5)+
+  xlab("")+ylab("Relative abundance (%)")+
+  theme(axis.text.x  = element_text(face = "italic", color="black", size = 8, angle=-50, hjust = 0, vjust=0.5)) +
+  ylim(0,40) +
+  scale_fill_manual(name="Old",values=c("#AF6125", "#F4E3C7")) +
+  stat_compare_means(label = "p.signif", hide.ns = TRUE) + 
+  ggtitle(label = "Oral") +
+  scale_x_discrete(labels = asv_labels_buccal) +
+  theme(plot.title = element_text(face = "bold"))
+p_top10_buccal_old
+
+```
+
+### DIFFERENTIAL ABUNDANCE BUCCAL SAMPLES
+
+* Compute differentially abundant taxa between age groups
+```{r, results='hide'}
+#transform phyloseq object to deseq object
+buccal.ddseq = phyloseq_to_deseq2(ps_buccal_glom, ~age_group)
+
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object (replaces 0s with 1s, I think)
+geoMeans = apply(counts(buccal.ddseq), 1, gm_mean)
+buccal.ddseq = estimateSizeFactors(buccal.ddseq, geoMeans = geoMeans)
+buccal.ddseq = DESeq(buccal.ddseq, test="LRT", reduced = ~1)
+```
+
+* Create a table of the results of the tests
+```{r, results='hide'}
+alpha = 0.01
+
+res.buccal1 = results(buccal.ddseq, contrast = c("age_group", "<1", "1-4"))
+sigtab.buccal1 = res.buccal1[which(res.buccal1$padj < alpha), ]
+sigtab.buccal1 = cbind(as(sigtab.buccal1, "data.frame"), as(tax_table(ps_buccal)[rownames(sigtab.buccal1), ], "matrix"))
+
+res.buccal2 = results(buccal.ddseq, contrast = c("age_group", "1-4", "5-9"))
+sigtab.buccal2 = res.buccal2[which(res.buccal2$padj < alpha), ]
+sigtab.buccal2 = cbind(as(sigtab.buccal2, "data.frame"), as(tax_table(ps_buccal)[rownames(sigtab.buccal2), ], "matrix"))
+
+res.buccal3 = results(buccal.ddseq, contrast = c("age_group", "5-9", "10-14"))
+sigtab.buccal3 = res.buccal3[which(res.buccal3$padj < alpha), ]
+sigtab.buccal3 = cbind(as(sigtab.buccal3, "data.frame"), as(tax_table(ps_buccal)[rownames(sigtab.buccal3), ], "matrix"))
+
+res.buccal4 = results(buccal.ddseq, contrast = c("age_group", "10-14", "≥15"))
+sigtab.buccal4 = res.buccal4[which(res.buccal4$padj < alpha), ]
+sigtab.buccal4 = cbind(as(sigtab.buccal4, "data.frame"), as(tax_table(ps_buccal)[rownames(sigtab.buccal4), ], "matrix"))
+```
+* info about analysis
+
+Number of taxa that are differentially expressed
+```{r}
+dim(sigtab.buccal4)
+mcols(res.buccal4, use.names = TRUE)
+```
+
+#### logfold change of differentially abundant taxa in macaque age groups
+```{r}
+theme_set(theme_classic())
+
+#subset data to only keep OTUs with more than +5 or -5 log2FoldChange
+sigtab.buccal1 <- subset(sigtab.buccal1, sigtab.buccal1$log2FoldChange <= -2 | sigtab.buccal1$log2FoldChange >= 2)
+sigtab.buccal2 <- subset(sigtab.buccal2, sigtab.buccal2$log2FoldChange <= -2 | sigtab.buccal2$log2FoldChange >= 2)
+sigtab.buccal3 <- subset(sigtab.buccal3, sigtab.buccal3$log2FoldChange <= -2 | sigtab.buccal3$log2FoldChange >= 2)
+sigtab.buccal4 <- subset(sigtab.buccal4, sigtab.buccal4$log2FoldChange <= -2 | sigtab.buccal4$log2FoldChange >= 2)
+
+# Phylum order
+x = tapply(sigtab.buccal1$log2FoldChange, sigtab.buccal1$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.buccal1$Phylum = factor(as.character(sigtab.buccal1$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.buccal1$log2FoldChange, sigtab.buccal1$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.buccal1$Genus = factor(as.character(sigtab.buccal1$Genus), levels=names(x))
+
+# Phylum order
+x = tapply(sigtab.buccal2$log2FoldChange, sigtab.buccal2$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.buccal2$Phylum = factor(as.character(sigtab.buccal2$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.buccal2$log2FoldChange, sigtab.buccal2$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.buccal2$Genus = factor(as.character(sigtab.buccal2$Genus), levels=names(x))
+
+# Phylum order
+x = tapply(sigtab.buccal3$log2FoldChange, sigtab.buccal3$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.buccal3$Phylum = factor(as.character(sigtab.buccal3$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.buccal3$log2FoldChange, sigtab.buccal3$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.buccal3$Genus = factor(as.character(sigtab.buccal3$Genus), levels=names(x))
+
+# Phylum order
+x = tapply(sigtab.buccal4$log2FoldChange, sigtab.buccal4$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.buccal4$Phylum = factor(as.character(sigtab.buccal4$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.buccal4$log2FoldChange, sigtab.buccal4$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.buccal4$Genus = factor(as.character(sigtab.buccal4$Genus), levels=names(x))
+
+
+p_buccal_DiffExp1 <- ggplot(sigtab.buccal1, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "Oral", subtitle = "<1 vs. 1-4 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top",
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8)) + 
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top")) +
+  xlab(NULL) + 
+  scale_color_manual(name = "Phylum", values = c("#F46D43", "#A50026", "#FDAE61", "#313695", "#ABD9E9", "#74ADD1", "#D73027", "#E0F3F8", "#4575B4")) #+ theme(legend.position = "none") 
+
+p_buccal_DiffExp2 <- ggplot(sigtab.buccal2, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "Oral", subtitle = "1-4 vs. 5-9 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top") + 
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top")) +
+  xlab(NULL) + 
+  scale_color_manual(name = "Phylum", values = c("#D73027", "#A50026", "#F46D43", "#FDAE61", "#313695", "#E0F3F8", "#ABD9E9", "#74ADD1", "#4575B4")) #+ theme(legend.position = "none") 
+
+p_buccal_DiffExp3 <- ggplot(sigtab.buccal3, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "Oral", subtitle = "5-9 vs. 10-14 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top") + 
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top")) +
+  xlab(NULL) + 
+  scale_color_manual(name = "Phylum", values = c("#D73027", "#A50026", "#F46D43", "#FDAE61", "#313695", "#E0F3F8", "#ABD9E9", "#74ADD1", "#4575B4")) 
+
+p_buccal_DiffExp4 <- ggplot(sigtab.buccal4, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "Oral", subtitle = "10-14 vs. ≥15 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top") + 
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top")) +
+  xlab(NULL) + 
+  scale_color_manual(name = "Phylum", values = c("#A50026", "#D73027", "#F46D43", "#FDAE61", "#313695", "#E0F3F8", "#ABD9E9", "#74ADD1", "#4575B4"))
+
+p_buccal_DiffExp1
+#p_buccal_DiffExp2
+#p_buccal_DiffExp3
+#p_buccal_DiffExp4
+```
+
+
+* Compute differentially abundant taxa in OLD MACAQUES
+```{r, results='hide'}
+#transform phyloseq object to deseq object
+buccal.ddseq = phyloseq_to_deseq2(ps_buccal, ~old)
+
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object (replaces 0s with 1s, I think)
+geoMeans = apply(counts(buccal.ddseq), 1, gm_mean)
+buccal.ddseq = estimateSizeFactors(buccal.ddseq, geoMeans = geoMeans)
+buccal.ddseq = DESeq(buccal.ddseq, test="Wald", fitType="local")
+```
+
+* Create a table of the results of the tests
+```{r, results='hide'}
+res.buccal = results(buccal.ddseq, cooksCutoff = FALSE)
+alpha = 0.01
+sigtab.buccal = res.buccal[which(res.buccal$padj < alpha), ]
+sigtab.buccal = cbind(as(sigtab.buccal, "data.frame"), as(tax_table(ps_buccal)[rownames(sigtab.buccal), ], "matrix"))
+head(sigtab.buccal)
+```
+* info about analysis
+
+Number of taxa that are differentially expressed - 2
+```{r}
+dim(sigtab.buccal)
+mcols(res.buccal, use.names = TRUE)
+```
+
+#### logfold change of differentially abundant taxa in old macaques (≥15 years)
+```{r}
+theme_set(theme_classic())
+scale_fill_discrete <- function(palname = "Set1", ...) {
+    scale_fill_brewer(palette = palname, ...)
+}
+# Phylum order
+x = tapply(sigtab.buccal$log2FoldChange, sigtab.buccal$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.buccal$Phylum = factor(as.character(sigtab.buccal$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.buccal$log2FoldChange, sigtab.buccal$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.buccal$Genus = factor(as.character(sigtab.buccal$Genus), levels=names(x))
+
+p_DiffExp_old_buccal <- ggplot(sigtab.buccal, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + geom_point() + theme(axis.text.x = element_text(angle = -50, hjust = 0, vjust=0.5)) + scale_color_manual(name = "Phylum", values = c("#D73027", "#FEE090")) + xlab(NULL) + ggtitle(label = "Oral") + theme(plot.title = element_text(face = "bold"))
+
+p_DiffExp_old_buccal
+```
+

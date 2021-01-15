@@ -1,0 +1,341 @@
+---
+title: "Cayo16S_dada2Code"
+---
+
+Load packages:
+```{r packages, message=FALSE}
+#install.packages("ggplot2")
+#library(ggplot2)
+
+x<-c("ggplot2", "dada2", "vegan", "tidyr","car","DESeq2", "phyloseq","FSA", "lme4", "ggpubr", 'reshape2')
+lapply(x, require, character.only = TRUE)
+```
+
+## First step: remove barcodes, indices, and primers from reads:
+These are Nextera-based adapter sequences.
+
+Can be removed with cutadapt or similar, or removed with trimLeft instead during filter and trim step below.
+
+Load metadata:
+```{r}
+dataset <- read.delim("./Cayo16S_metadata_Aging_MS.txt",header=T,row.names = 1)
+
+dataset$sample_ID <- rownames(dataset)
+
+dataset$age[is.na(dataset$age)] <- -1
+
+dataset$control <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$sample_type[i]== "negcontrol"){
+    dataset$control[i] <- "Yes"
+  }
+  if (dataset$sample_type[i]== "poscontrol"){
+    dataset$control[i] <- "Yes"
+  }
+}
+
+dataset$infant <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 0){
+    dataset$infant[i] <- "Yes"
+  }
+}
+
+dataset$age_group <- "<1"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 1| dataset$age[i] == 2| dataset$age[i] == 3 | dataset$age[i] == 4){
+    dataset$age_group[i] <- "1-4"
+  }
+  else if (dataset$age[i] == 5| dataset$age[i] == 6| dataset$age[i] == 7 | dataset$age[i] == 8 | dataset$age[i] == 9){
+    dataset$age_group[i] <- "5-9"
+  }
+  else if (dataset$age[i] == 10 | dataset$age[i] == 11| dataset$age[i] == 12 | dataset$age[i] == 13 | dataset$age[i] == 14){
+    dataset$age_group[i] <- "10-14"
+  }
+  else if (dataset$age[i] == 15| dataset$age[i] >= 15){
+    dataset$age_group[i] <- "≥15"
+  }
+  else if (dataset$age[i] == -1){
+    dataset$age_group[i] <- NA
+  }
+}
+
+dataset$age_group[is.na(dataset$age_group)] <- "other"
+
+dataset[dataset==-1] <- NA
+
+dataset$sex <- as.character(dataset$sex)
+
+buccal_dataset <- subset(dataset, sample_type=="buccal" | sample_ID == "NegCtrl5")
+rectal_dataset <- subset(dataset, sample_type == "rectal" | sample_ID == "NegCtrl13")
+genital_dataset <- subset(dataset, sample_type == "genital" | sample_ID == "NegCtrl3")
+```
+
+## Handling 16S DNA sequences with DADA2
+
+Dada2 Tutorial for 16S: https://benjjneb.github.io/dada2/tutorial.html
+
+###1. Set path to your folder containing the sequences
+
+```{r path}
+# CHANGE ME to the directory containing the fastq files after unzipping.
+path <- "~/Documents/Cayo_Microbiome/sequences/unzipped_trimmed"
+list.files(path)
+```
+
+###2. File names
+
+First, we read in the names of the fastq files, and perform some string manipulation.
+
+Sort ensures forward/reverse files are in same order.
+
+Then we extract sample names from our forward list.
+
+**Here the string manipulation has to be tailored to each different run.**
+
+```{r names}
+fnFs <- sort(list.files(path, pattern="_R1_001.fastq")) # forward files
+fnRs <- sort(list.files(path, pattern="_R2_001.fastq")) # reverse files
+sample.names <- sapply(strsplit(fnFs, "_"), `[`, 1)
+sample.names
+fnFs <- file.path(path, fnFs)
+fnRs <- file.path(path, fnRs)
+```
+
+###3. Inspect quality profiles
+
+The median quality score at each position is shown by the green line, and the quartiles of the quality score distribution by the orange lines.
+
+The red line shows the scaled proportion of reads that extend to at least that position (this is more useful for other sequencing technologies, as Illumina reads are typically all the same length, hence the flat red line).
+
+#### Let's look first at the forward reads
+
+```{r quality forward reads}
+ plotQualityProfile(fnFs[15:16])
+```
+##### Now let's look at the reverse reads
+
+```{r quality reverse reads}
+plotQualityProfile(fnRs[15:16])
+```
+###4. Filter and trim
+
+I will truncate the forward reads at position 240 (trimming the last 20 nucleotides).
+
+The reverse reads are of significantly worse quality, especially at the end, which is common in Illumina sequencing. This isn’t too worrisome, as DADA2 incorporates quality information into its error model which makes the algorithm robust to lower quality sequence, but trimming as the average qualities crash will improve the algorithm’s sensitivity to rare sequence variants. Based on these profiles, we will truncate the reverse reads at position 200.
+
+**Considerations for your own data** Your reads must still overlap after truncation in order to merge them later! We are using 2x250 V4 sequence data, our trimming has to ensure overlap is happening (your **truncLen** must be large enough to maintain 20 + biological.length.variation nucleotides of overlap between them).
+
+#### Place filtered files in filtered/ subdirectory
+
+```{r filtered}
+filt_path <- file.path(path, "filtered") 
+filtFs <- file.path(filt_path, paste0(sample.names, "_F_filt.fastq.gz"))
+filtRs <- file.path(filt_path, paste0(sample.names, "_R_filt.fastq.gz"))
+```
+
+#### Filter the reads
+
+This step usually takes the longest and the most part of your CPU power. On Cayo 16S data, it took about 10 minutes.
+
+```{r filter}
+help("filterAndTrim")
+out <- filterAndTrim(fnFs, filtFs, fnRs, filtRs, truncLen=c(240,200), trimLeft = c(19,20),
+maxN=0, maxEE=c(2,2), truncQ=2, rm.phix=TRUE,
+compress=TRUE, multithread=TRUE)
+head(out)
+```
+
+The maxEE parameter sets the maximum number of “expected errors” allowed in a read, which is a better filter than simply averaging quality scores.
+
+**Considerations for your own data** The filtering parameters are starting points, not set in stone.
+
+If you want to speed up downstream computation, consider tightening maxEE.
+
+If too few reads are passing the filter, consider relaxing maxEE, perhaps especially on the reverse reads (eg. maxEE=c(2,5)), and reducing the truncLen to remove low quality tails.
+
+Remember though, when choosing truncLen for paired-end reads you must maintain overlap after truncation in order to merge them later.
+
+###5. Learn the error rates 
+
+The DADA2 algorithm makes use of a parametric error model (err) and every amplicon dataset has a different set of error rates.
+
+The learnErrors method learns this error model from the data, by alternating estimation of the error rates and inference of sample composition until they converge on a jointly consistent solution.
+
+As in many machine-learning problems, the algorithm must begin with an initial guess, for which the maximum possible error rates in this data are used (the error rates if only the most abundant sequence is correct and all the rest are errors).
+
+```{r error rates}
+errF <- learnErrors(filtFs, multithread=TRUE)
+errR <- learnErrors(filtRs, multithread=TRUE)
+plotErrors(errF, nominalQ=TRUE)
+```
+
+* The error rates for each possible transition (A→C, A→G, …) are shown.
+
+* Points are the observed error rates for each consensus quality score.
+
+* The black line shows the estimated error rates after convergence of the machine-learning algorithm.
+
+* The red line shows the error rates expected under the nominal definition of the Q-score.
+
+* Here the estimated error rates (black line) are a good fit to the observed rates (points), and the error rates drop with increased quality as expected.
+
+* If everything looks reasonable, we can proceed with confidence.
+
+**Considerations for your own data** Parameter learning is computationally intensive, so by default the learnErrors function uses only a subset of the data (the first 100M bases).
+
+**If you are working with a large dataset** and the plotted error model does not look like a good fit, you can try increasing the nbases parameter to see if the fit improves.
+
+###6. Dereplication
+
+* Dereplication combines all identical sequencing reads into into “unique sequences” with a corresponding “abundance” equal to the number of reads with that unique sequence.
+
+* Dereplication substantially reduces computation time by eliminating redundant comparisons.
+
+* Dereplication in the DADA2 pipeline has one crucial addition from other pipelines: DADA2 retains a summary of the quality information associated with each unique sequence.
+
+* The consensus quality profile of a unique sequence is the average of the positional qualities from the dereplicated reads.
+
+* These quality profiles inform the error model of the subsequent sample inference step, significantly increasing DADA2’s accuracy.
+
+```{r dereplication}
+derepFs <- derepFastq(filtFs, verbose=F)
+derepRs <- derepFastq(filtRs, verbose=F)
+
+# Name the derep-class objects by the sample names
+names(derepFs) <- sample.names
+names(derepRs) <- sample.names
+```
+
+###7. Sample inference
+
+```{r inference}
+dadaFs <- dada(derepFs, err=errF, multithread=TRUE)
+dadaRs <- dada(derepRs, err=errR, multithread=TRUE)
+
+#Inspection
+dadaFs[[1]]
+dadaRs[[1]]
+```
+
+###8. Merge paired reads
+
+* We now merge the forward and reverse reads together to obtain the full denoised sequences.
+
+* Merging is performed by aligning the denoised forward reads with the reverse-complement of the corresponding denoised reverse reads, and then constructing the merged “contig” sequences.
+
+* By default, merged sequences are only output if the forward and reverse reads overlap by at least 12 bases, and are identical to each other in the overlap region.
+
+```{r merging}
+mergers <- mergePairs(dadaFs, derepFs, dadaRs, derepRs, verbose=TRUE)
+# Inspect the merger data.frame from the first sample
+head(mergers[[250]])
+```
+
+* The mergers object is a list of data.frames from each sample.
+
+* Each data.frame contains the merged $sequence, its $abundance, and the indices of the $forward and $reverse sequence variants that were merged. 
+
+* Paired reads that did not exactly overlap were removed by mergePairs, further reducing spurious output.
+
+###9. Construct sequence table
+
+* We can now construct an amplicon sequence variant table (ASV) table, a higher-resolution version of the OTU table produced by traditional methods.
+
+```{r sequence table}
+seqtab <- makeSequenceTable(mergers)
+dim(seqtab)
+# Inspect distribution of sequence lengths
+table(nchar(getSequences(seqtab)))
+# Remove non-target-length sequences with base R manipulations of the sequence table
+seqtab2 <- seqtab[,nchar(colnames(seqtab)) %in% seq(252,254)]
+table(nchar(getSequences(seqtab2)))
+seqtab<-seqtab2
+```
+
+* The sequence table is a matrix with rows corresponding to (and named by) the samples, and columns corresponding to (and named by) the sequence variants.
+
+**Considerations for your own data** Sequences that are much longer or shorter than expected may be the result of non-specific priming.
+
+###10. Remove chimeras
+
+* The core dada2 method corrects substitution and indel errors, but chimeras remain.
+
+* Fortunately, the accuracy of the sequence variants after denoising makes identifying chimeras simpler than it is when dealing with fuzzy OTUs. 
+
+* Chimeric sequences are identified if they can be exactly reconstructed by combining a left-segment and a right-segment from two more abundant “parent” sequences.
+
+```{r chimeras}
+seqtab.nochim <- removeBimeraDenovo(seqtab, method="consensus", multithread=TRUE, verbose=TRUE)
+dim(seqtab.nochim)
+sum(seqtab.nochim)/sum(seqtab)
+
+#save seqtab.nochim as R object for later use in other analyses:
+saveRDS(seqtab.nochim, "./seqtab.nochim_Cayo16S.rds")
+```
+
+* The frequency of chimeric sequences varies substantially from dataset to dataset, and depends on on factors including experimental procedures and sample complexity.
+
+**Considerations for your own data** Most of your reads should remain after chimera removal (it is not uncommon for a majority of sequence variants to be removed though).
+
+* If most of your reads were removed as chimeric, upstream processing may need to be revisited.
+
+* In almost all cases this is caused by primer sequences with ambiguous nucleotides that were not removed prior to beginning the DADA2 pipeline.
+
+###11. Track reads through the pipeline
+
+As a final check of our progress, we’ll look at the number of reads that made it through each step in the pipeline:
+
+```{r track}
+getN <- function(x) sum(getUniques(x))
+track <- cbind(out, sapply(dadaFs, getN), sapply(dadaRs, getN), sapply(mergers, getN), rowSums(seqtab.nochim))
+# If processing a single sample, remove the sapply calls: e.g. replace sapply(dadaFs, getN) with getN(dadaFs)
+colnames(track) <- c("input", "filtered", "denoisedF", "denoisedR", "merged", "nonchim")
+rownames(track) <- sample.names
+track
+```
+
+Looks good! We kept the majority of our raw reads, and there is no over-large drop associated with any single step.
+
+**Considerations for your own data** This is a great place to do a last sanity check.
+
+Outside of filtering (depending on how stringent you want to be) there should no step in which a majority of reads are lost.
+
+If a majority of reads failed to merge, you may need to revisit the truncLen parameter used in the filtering step and make sure that the truncated reads span your amplicon.
+
+If a majority of reads were removed as chimeric, you may need to revisit the removal of primers, as the ambiguous nucleotides in unremoved primers interfere with chimera identification.
+
+###12. Assign taxonomy
+
+The DADA2 package provides a native implementation of the naive Bayesian classifier method for this purpose.
+
+The assignTaxonomy function takes as input a set of sequences to be classified and a training set of reference sequences with known taxonomy, and outputs taxonomic assignments with at least minBoot bootstrap confidence.
+
+We maintain formatted training fastas for the RDP training set, GreenGenes clustered at 97% identity, and the Silva reference database, and additional trainings fastas suitable for protists and certain specific environments have been contributed.
+
+**Extensions** The dada2 package also implements a method to make species level assignments based on exact matching between ASVs and sequenced reference strains.
+
+Recent analysis suggests that exact matching (or 100% identity) is the only appropriate way to assign species to 16S gene fragments.
+
+Currently, species-assignment training fastas are available for the Silva and RDP 16S databases. The fastas used here can be downloaded from https://doi.org/10.5281/zenodo.1172783
+
+**Download Silva taxonomic training data before proceeding**
+(I saved them to a new folder called "tax" in this case)
+
+```{r taxonomy}
+taxa <- assignTaxonomy(seqtab.nochim, "./tax/silva_nr_v132_train_set.fa.gz", multithread=TRUE)
+taxa <- addSpecies(taxa, "./tax/silva_species_assignment_v132.fa.gz")
+taxa.print <- taxa # Removing sequence rownames for display only
+rownames(taxa.print) <- NULL
+head(taxa.print)
+```
+
+###13. Handoff to Phyloseq package and saving otu table/taxa table for future use 
+
+The rownames from your metadata have to match the rownames from your sequencing file.
+
+```{r phyloseq}
+write.csv(taxa,"./taxaGF.csv")
+```
+
+Continue with markdown files "global analyses" or body site specific markdowns for downstream analyses.

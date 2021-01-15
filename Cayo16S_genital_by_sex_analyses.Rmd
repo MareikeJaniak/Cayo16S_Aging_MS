@@ -1,0 +1,1451 @@
+---
+title: "Cayo16S_genital_by_sex_analyses"
+author: "Mareike"
+date: "7/22/2020"
+output: html_document
+---
+
+### Genital swabs analyzed by sex
+
+**Downstream analyses - the dada2Code markdown file should be run first to generate the necessary input files**
+
+Load packages
+```{r}
+library(decontam)
+library(phyloseq)
+library(ggplot2)
+library(forestmangr)
+library(reshape2)
+library(ggpubr)
+library(plyr)
+library(scales)
+```
+
+
+### Genital samples - males and females analyzed separately
+
+Read in metadata and otu table
+```{r}
+dataset <- read.csv("./Cayo16S_metadata_Aging_MS.txt",header=T,row.names = 1)
+quant_data <- read.delim("./Cayo16S_copy_number_data.tsv", header = T)
+quant_data <- quant_data$copy_number
+
+dataset$sample_ID <- rownames(dataset)
+
+dataset <- cbind(dataset, quant_data)
+
+dataset$control <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$sample_type[i]== "negcontrol"){
+    dataset$control[i] <- "Yes"
+  }
+  if (dataset$sample_type[i]== "poscontrol"){
+    dataset$control[i] <- "Yes"
+  }
+}
+
+dataset$age[is.na(dataset$age)] <- -1
+
+dataset$infant <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 0){
+    dataset$infant[i] <- "Yes"
+  }
+}
+
+dataset$age_group <- "<1"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 1| dataset$age[i] == 2| dataset$age[i] == 3 | dataset$age[i] == 4){
+    dataset$age_group[i] <- "1-4"
+  }
+  else if (dataset$age[i] == 5| dataset$age[i] == 6| dataset$age[i] == 7 | dataset$age[i] == 8 | dataset$age[i] == 9){
+    dataset$age_group[i] <- "5-9"
+  }
+  else if (dataset$age[i] == 10 | dataset$age[i] == 11| dataset$age[i] == 12 | dataset$age[i] == 13 | dataset$age[i] == 14){
+    dataset$age_group[i] <- "10-14"
+  }
+  else if (dataset$age[i] == 15| dataset$age[i] >= 15){
+    dataset$age_group[i] <- "≥15"
+  }
+  else if (dataset$age[i] == -1){
+    dataset$age_group[i] <- NA
+  }
+}
+
+dataset$age_group[is.na(dataset$age_group)] <- "other"
+
+dataset$old <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] >= 15){
+    dataset$old[i] <- "Yes"
+  }
+}
+
+dataset[dataset==-1] <- NA
+
+dataset$sex <- as.character(dataset$sex)
+```
+
+Create phyloseq object
+```{r}
+seqtab.nochim <- readRDS("./seqtab.nochim_Cayo16S.rds")
+taxa <- read.csv("./taxaGF.csv", row.names = 1)
+
+ps <- phyloseq(otu_table(as.matrix(seqtab.nochim), taxa_are_rows = FALSE), 
+               sample_data(dataset), 
+               tax_table(as.matrix(taxa)))
+```
+
+Create datasets for vaginal and penile samples
+```{r}
+vaginal_dataset <- subset(dataset, sample_type == "genital" & sex == "f" | sample_ID == "NegCtrl3")
+penile_dataset <- subset(dataset, sample_type == "genital" & sex == "m" | sample_ID == "NegCtrl3")
+```
+
+Subset phyloseq object for females
+```{r}
+ps_vaginal <- subset_samples(ps, sample_type == "genital" & sex == "f" | sample_ID == "NegCtrl3")
+ps_vaginal <- prune_taxa(taxa_sums(ps_vaginal) > 0, ps_vaginal)
+```
+
+Subset phyloseq object for males
+```{r}
+ps_penile <- subset_samples(ps, sample_type == "genital" & sex == "m" | sample_ID == "NegCtrl3")
+ps_penile <- prune_taxa(taxa_sums(ps_penile) > 0, ps_penile)
+```
+
+#### Identify Contaminants - Frequency
+
+The first contaminant identification method we’ll use is the “frequency” method. In this method, the distribution of the frequency of each sequence feature as a function of the input DNA concentration is used to identify contaminants.
+
+```{r}
+contamdf.freq.f <- isContaminant(ps_vaginal, method="frequency", conc="quant_data")
+head(contamdf.freq.f)
+
+contamdf.freq.m <- isContaminant(ps_penile, method="frequency", conc="quant_data")
+head(contamdf.freq.m)
+```
+
+This calculation has returned a data.frame with several columns, the most important being $p which containts the probability that was used for classifying contaminants, and $contaminant which contains TRUE/FALSE classification values with TRUE indicating that the statistical evidence that the associated sequence feature is a contaminant exceeds the user-settable threshold. As we did not specify the threshold, the default value of threshold = 0.1 was used, and $contaminant=TRUE if $p < 0.1.
+```{r}
+table(contamdf.freq.f$contaminant)
+head(which(contamdf.freq.f$contaminant))
+
+table(contamdf.freq.m$contaminant)
+head(which(contamdf.freq.m$contaminant))
+```
+
+In this plot the dashed black line shows the model of a noncontaminant sequence feature for which frequency is expected to be independent of the input DNA concentration. The red line shows the model of a contaminant sequence feature, for which frequency is expected to be inversely proportional to input DNA concentration, as contaminating DNA will make up a larger fraction of the total DNA in samples with very little total DNA. 
+
+```{r}
+plot_frequency(ps_vaginal, taxa_names(ps_vaginal)[which(contamdf.freq.f$contaminant)], conc="quant_data") + 
+  xlab("DNA Concentration (qPCR (molecules/ul))")
+
+plot_frequency(ps_penile, taxa_names(ps_penile)[which(contamdf.freq.m$contaminant)], conc="quant_data") + 
+  xlab("DNA Concentration (qPCR (molecules/ul))")
+```
+
+Remove contaminants and negative control for further analyses:
+```{r}
+ps_vaginal <- prune_taxa(!contamdf.freq.f$contaminant, ps_vaginal)
+ps_vaginal <- subset_samples(ps_vaginal, sample_ID != "NegCtrl3")
+vaginal_dataset <- subset(vaginal_dataset, sample_ID != "NegCtrl3")
+
+ps_penile <- prune_taxa(!contamdf.freq.m$contaminant, ps_penile)
+ps_penile <- subset_samples(ps_penile, sample_ID != "NegCtrl3")
+penile_dataset <- subset(penile_dataset, sample_ID != "NegCtrl3")
+```
+
+Which samples have fewer than 2000 reads?
+```{r}
+sample_sums(ps_vaginal)>=2000
+
+sample_sums(ps_penile)>=2000
+```
+
+Remove samples with fewer than 2000 reads
+```{r}
+ps_vaginal <- prune_samples(sample_sums(ps_vaginal)>=2000, ps_vaginal)
+vaginal_dataset <- subset(vaginal_dataset, sample_ID != "MB103805" & sample_ID != "MB102071")
+ps_vaginal <- prune_taxa(taxa_sums(ps_vaginal) > 0, ps_vaginal)
+ps_vaginal
+
+
+ps_penile <- prune_samples(sample_sums(ps_penile)>=2000, ps_penile)
+penile_dataset <- subset(penile_dataset, sample_ID != "MB000217" & sample_ID != "MB105080")
+ps_penile <- prune_taxa(taxa_sums(ps_penile) > 0, ps_penile)
+ps_penile
+```
+
+### Taxonomic Filtering
+create a table of number of features for each Phylum present in the dataset
+```{r}
+rank_names(ps_vaginal)
+table(tax_table(ps_vaginal)[, "Phylum"], exclude = NULL)
+
+rank_names(ps_penile)
+table(tax_table(ps_penile)[, "Phylum"], exclude = NULL)
+```
+
+Remove features with NA or ambiguous phylum annotation from dataset:
+```{r}
+ps_vaginal <- subset_taxa(ps_vaginal, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+ps_vaginal
+
+ps_penile <- subset_taxa(ps_penile, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+ps_penile
+```
+
+A useful next step is to explore feature prevalence in the dataset, which we will define here as the number of samples in which a taxon appears at least once.
+```{r}
+# Compute prevalence of each feature, store as data.frame
+prevdf.f = apply(X = otu_table(ps_vaginal),
+               MARGIN = ifelse(taxa_are_rows(ps_vaginal), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf.f = data.frame(Prevalence = prevdf.f,
+                    TotalAbundance = taxa_sums(ps_vaginal),
+                    tax_table(ps_vaginal))
+```
+
+```{r}
+# Compute prevalence of each feature, store as data.frame
+prevdf.m = apply(X = otu_table(ps_penile),
+               MARGIN = ifelse(taxa_are_rows(ps_penile), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf.m = data.frame(Prevalence = prevdf.m,
+                    TotalAbundance = taxa_sums(ps_penile),
+                    tax_table(ps_penile))
+```
+
+Are there phyla that are comprised of mostly low-prevalence features? Compute the total and average prevalences of the features in each phylum.
+
+```{r}
+plyr::ddply(prevdf.f, "Phylum", function(df1){cbind(mean(df1$Prevalence),sum(df1$Prevalence))})
+```
+
+Filter phyla:
+```{r}
+filterPhylaVaginal = c("Deferribacteres", "Synergistetes", "Cyanobacteria")
+ps_vaginal = subset_taxa(ps_vaginal, !Phylum %in% filterPhylaVaginal)
+ps_vaginal
+```
+
+```{r}
+plyr::ddply(prevdf.m, "Phylum", function(df1){cbind(mean(df1$Prevalence),sum(df1$Prevalence))})
+```
+
+Filter phyla:
+```{r}
+filterPhylaPenile = c("Dependentiae", "Deferribacteres", "Entotheonellaeota", "Latescibacteria", "Cyanobacteria")
+ps_penile = subset_taxa(ps_penile, !Phylum %in% filterPhylaPenile)
+ps_penile
+```
+
+#### Prevalence Filtering
+```{r}
+# Subset to the remaining phyla
+prevdf.f1 = subset(prevdf.f, Phylum %in% get_taxa_unique(ps_vaginal, "Phylum"))
+ggplot(prevdf.f1, aes(TotalAbundance, Prevalence / nsamples(ps_vaginal),color=Phylum)) +
+  # Include a guess for parameter
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 2) +  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+```
+
+```{r}
+# Subset to the remaining phyla
+prevdf.m1 = subset(prevdf.m, Phylum %in% get_taxa_unique(ps_penile, "Phylum"))
+ggplot(prevdf.m1, aes(TotalAbundance, Prevalence / nsamples(ps_penile),color=Phylum)) +
+  # Include a guess for parameter
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 2) +  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+```
+
+Set prevalence threshold to ten percent and remove taxa that occur in less than ten percent of samples:
+```{r}
+# Define prevalence threshold as 10% of total samples
+prevalenceThresholdVaginal = 0.1 * nsamples(ps_vaginal)
+prevalenceThresholdVaginal
+
+prevalenceThresholdPenile = 0.1 * nsamples(ps_penile)
+prevalenceThresholdPenile
+```
+
+```{r}
+# Execute prevalence filter, using `prune_taxa()` function
+keepTaxavaginal = rownames(prevdf.f1)[(prevdf.f1$Prevalence >= 5)]
+ps_vaginal = prune_taxa(keepTaxavaginal, ps_vaginal)
+ps_vaginal
+
+keepTaxapenile = rownames(prevdf.m1)[(prevdf.m1$Prevalence >= 4)]
+ps_penile = prune_taxa(keepTaxapenile, ps_penile)
+ps_penile
+```
+
+
+##### Change order of factors for plots:
+```{r}
+vaginal_dataset$age_group <- factor(vaginal_dataset$age_group, levels = c("<1", "1-4", "5-9", "10-14", "≥15"))
+vaginal_dataset$infant <- factor(vaginal_dataset$infant, levels = c("Yes", "No"))
+
+penile_dataset$age_group <- factor(penile_dataset$age_group, levels = c("<1", "1-4", "5-9", "10-14", "≥15"))
+penile_dataset$infant <- factor(penile_dataset$infant, levels = c("Yes", "No"))
+```
+##### Merge youngest age group for vaginal data
+* Only two samples for <1 age group, merging with 1-4 year olds in new <1-4 age group
+```{r}
+vaginal_dataset$age_group <- revalue(vaginal_dataset$age_group, c("<1" = "<1-4", "1-4" = "<1-4"))
+vaginal_dataset$age_group <- factor(vaginal_dataset$age_group, levels = c("<1-4", "5-9", "10-14", "≥15"))
+```
+
+Add altered sample datasets to phyloseq objects
+```{r}
+new_vaginal_sample_data <- phyloseq::sample_data(vaginal_dataset)
+
+new_penile_sample_data <- phyloseq::sample_data(penile_dataset)
+
+sample_data(ps_vaginal) <- new_vaginal_sample_data
+sample_data(ps_penile) <- new_penile_sample_data
+```
+
+Save phyloseq object for future analyses, without need for re-doing filtering steps:
+```{r}
+saveRDS(ps_vaginal, "./PhyloseqObjects/ps_vaginal.rds")
+
+saveRDS(ps_penile, "./PhyloseqObjects/ps_penile.rds")
+```
+
+
+##### Obtaining files for PiCrust2
+
+Vaginal
+* Rename ASVs with short name, instead of full sequence
+```{r, eval=FALSE}
+vaginal_dna <- Biostrings::DNAStringSet(taxa_names(ps_vaginal))
+names(vaginal_dna) <- taxa_names(ps_vaginal)
+ps_vaginal_short <- merge_phyloseq(ps_vaginal, vaginal_dna)
+taxa_names(ps_vaginal_short) <- paste0("ASV", seq(ntaxa(ps_vaginal_short)))
+ps_vaginal_short
+```
+
+* Save fasta file from phyloseq object for PiCrust2 analyses
+* Save in PiCrust2_in folder to keep things organized
+```{r, eval=FALSE}
+Biostrings::writeXStringSet(refseq(ps_vaginal_short), "./PiCrust2_in/vaginal_seqs.fasta")
+```
+
+* Save otu table as csv with taxa as rows
+```{r, eval=FALSE}
+# Extract abundance matrix from the phyloseq object
+vaginal_otu = as(otu_table(ps_vaginal_short), "matrix")
+# transpose if necessary
+vaginal_otu <- t(vaginal_otu)
+# Coerce to data.frame
+vaginal_otu_df = as.data.frame(vaginal_otu)
+write.table(vaginal_otu_df, "./PiCrust2_in/vaginal_otu.tsv", sep = "\t", quote = FALSE)
+```
+
+Penile
+* Rename ASVs with short name, instead of full sequence
+```{r, eval=FALSE}
+penile_dna <- Biostrings::DNAStringSet(taxa_names(ps_penile))
+names(penile_dna) <- taxa_names(ps_penile)
+ps_penile_short <- merge_phyloseq(ps_penile, penile_dna)
+taxa_names(ps_penile_short) <- paste0("ASV", seq(ntaxa(ps_penile_short)))
+ps_penile_short
+```
+
+* Save fasta file from phyloseq object
+```{r, eval=FALSE}
+Biostrings::writeXStringSet(refseq(ps_penile_short), "./PiCrust2_in/penile_seqs.fasta")
+```
+
+* Save otu table as csv with taxa as rows
+```{r, eval=FALSE}
+# Extract abundance matrix from the phyloseq object
+penile_otu = as(otu_table(ps_penile_short), "matrix")
+# transpose if necessary
+penile_otu <- t(penile_otu)
+# Coerce to data.frame
+penile_otu_df = as.data.frame(penile_otu)
+write.table(penile_otu_df, "./PiCrust2_in/penile_otu.tsv", sep = "\t", quote = FALSE)
+```
+
+
+### Main Analyses
+Read in phyloseq object if not currently in environment:
+```{r}
+ps_vaginal <- readRDS("./PhyloseqObjects/ps_vaginal.rds")
+
+ps_penile <- readRDS("./PhyloseqObjects/ps_penile.rds")
+
+vaginal_dataset <- read.csv("./PiCrust2_in/vaginal_dataset_FunkyTax.csv", header = TRUE, row.names = 1)
+penile_dataset <- read.csv("./PiCrust2_in/penile_dataset_FunkyTax.csv", header = TRUE, row.names = 1)
+```
+
+Reorder variables:
+```{r}
+penile_dataset$age_group <- factor(penile_dataset$age_group, levels = c("<1", "1-4", "5-9", "10-14", "≥15"))
+penile_dataset$infant <- factor(penile_dataset$infant, levels = c("Yes", "No"))
+
+vaginal_dataset$age_group <- factor(vaginal_dataset$age_group, levels = c("<1-4", "5-9", "10-14", "≥15"))
+
+vaginal_dataset$infant <- factor(vaginal_dataset$infant, levels = c("Yes", "No"))
+```
+
+### DIVERSITY
+#### Alpha-diversity (Shannon) and species richness (Chao1)
+* On unfiltered ps object
+
+* CHAO1 and Shannon Index
+
+```{r computation}
+adiv<-estimate_richness(ps,measures=c("Observed","Shannon","Chao1"))
+
+adiv_vaginal <- subset(adiv, rownames(adiv) %in% rownames(vaginal_dataset))
+vaginal_dataset$alphadiv<-adiv_vaginal$Shannon
+#hist(vaginal_dataset$alphadiv)
+vaginal_dataset$chao1<-adiv_vaginal$Chao1
+#hist(vaginal_dataset$chao1)
+vaginal_dataset$evenness<-adiv_vaginal$Shannon/log(adiv_vaginal$Observed)
+
+adiv_penile <- subset(adiv, rownames(adiv) %in% rownames(penile_dataset))
+penile_dataset$alphadiv<-adiv_penile$Shannon
+#hist(penile_dataset$alphadiv)
+penile_dataset$chao1<-adiv_penile$Chao1
+#hist(penile_dataset$chao1)
+penile_dataset$evenness<-adiv_penile$Shannon/log(adiv_penile$Observed)
+```
+
+###### Boxplots
+
+* Shannon Index by age groups
+
+Vaginal
+```{r}
+my_comparisons <- list(c("<1-4", "5-9"), c("5-9","10-14"), c("10-14","≥15"))
+
+p_age_shannon_vaginal<-ggplot(vaginal_dataset, aes(age_group, alphadiv,fill=age_group)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.8)+geom_jitter(width=0.1) +
+  xlab("Age Group")+ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Age group",values=c("#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  guides(fill=F,color=F) + 
+  stat_compare_means(label.y = 5.3) +
+  ggtitle(label = "Vaginal") + 
+  theme(plot.title = element_text(face = "bold"))
+p_age_shannon_vaginal
+```
+
+
+Penile
+```{r}
+#my_comparisons.m <- list(c("<1", "1-4"), c("1-4", "5-9"), c("5-9","10-14"), c("10-14","≥15"))
+
+p_age_shannon_penile<-ggplot(penile_dataset, aes(age_group, alphadiv,fill=age_group)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("Age Group")+ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Age group",values=c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  guides(fill=F,color=F) + 
+  stat_compare_means(label.y = 5.3) + 
+  ggtitle(label = "Penile") + 
+  theme(plot.title = element_text(face = "bold"))
+p_age_shannon_penile
+```
+
+* Penile Shannon index by infant yes or no
+```{r}
+p_infant_shannon_penile<-ggplot(penile_dataset, aes(infant, alphadiv,fill=infant)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) + 
+  geom_jitter(width=0.1, height = 0) +
+  ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Life stage", labels = c("infant", "non-infant"), values=c("cornflowerblue","purple")) +
+  stat_compare_means() + 
+  scale_x_discrete(labels = c("infant", "non-infant")) +
+  guides(fill = F) +
+  ggtitle(label = "Penile") + 
+  theme(plot.title = element_text(face = "bold")) +
+  xlab("Life stage") +
+  ylim(1.5, 5.5)
+p_infant_shannon_penile
+```
+* Penile Shannon index by old yes or no
+```{r}
+p_shannon_penile_old<-ggplot(penile_dataset, aes(old, alphadiv,fill=old)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) +
+  geom_jitter(width=0.1) +
+  xlab("15 years or older") +
+  ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Old",values=c("#AF6125", "#F4E3C7")) +
+  guides(fill=F,color=F) + stat_compare_means() + 
+  ggtitle(label = "Penile") + theme(plot.title = element_text(face = "bold")) +
+  ylim(1.5,5.5)
+p_shannon_penile_old 
+```
+
+
+For vaginal samples create new "young" category to compare <1-4 age group to others, due to very low sample size <1
+```{r}
+vaginal_dataset$young <- "No"
+for (i in 1:length(vaginal_dataset$sample_type))
+  if (vaginal_dataset$age_group[i] == '<1-4'){
+    vaginal_dataset$young[i] <- "Yes"
+  }
+
+vaginal_dataset$young <- factor(vaginal_dataset$young, levels = c("Yes", "No"))
+```
+
+```{r}
+p_young_shannon_vaginal<-ggplot(vaginal_dataset, aes(young, alphadiv,fill=young)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) + 
+  geom_jitter(width=0.1, height = 0) +
+  ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Life stage", labels = c("young", "not young"), values=c("cornflowerblue","purple")) +
+  guides(fill = F) +
+  stat_compare_means() + 
+  ggtitle(label = "Vaginal") + 
+  theme(plot.title = element_text(face = "bold")) +
+  scale_x_discrete(labels = c("young", "not young")) +
+  xlab("Life stage") +
+  ylim(1.5, 5.5)
+p_young_shannon_vaginal
+```
+* Vaginal Shannon by old yes or no:
+```{r}
+p_shannon_vaginal_old<-ggplot(vaginal_dataset, aes(old, alphadiv,fill=old)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) +
+  geom_jitter(width=0.1) +
+  xlab("15 years or older") +
+  ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="Old",values=c("#AF6125", "#F4E3C7")) +
+  guides(fill=F,color=F) + stat_compare_means() + 
+  ggtitle(label = "Vaginal") + theme(plot.title = element_text(face = "bold")) +
+  ylim(1.5,5.5)
+p_shannon_vaginal_old 
+```
+
+Alpha-diversity combo figure
+```{r}
+p_alpha_vagpen_combo <- ggarrange(p_infant_shannon_penile, p_young_shannon_vaginal, nrow = 1, labels = "auto")
+
+ggsave(plot = p_alpha_vagpen_combo, "./Figures/VagPen_alphadiv_combo.pdf", height = 4.5, width = 8, useDingbats = FALSE)
+```
+
+### Ordinations
+
+* Compute ordination (dada2 tutorial)
+```{r}
+# Ordination (from DADA2 tutorial)
+ps_vaginal.prop <- transform_sample_counts(ps_vaginal, function(otu) otu/sum(otu))
+
+bray_vaginal <- distance(ps_vaginal.prop, method = "bray")
+ord.nmds.bray_vaginal <- ordinate(ps_vaginal.prop, method="NMDS", distance="bray")
+
+ps_penile.prop <- transform_sample_counts(ps_penile, function(otu) otu/sum(otu))
+
+bray_penile <- distance(ps_penile.prop, method = "bray")
+ord.nmds.bray_penile <- ordinate(ps_penile.prop, method="NMDS", distance="bray")
+```
+* Plot
+```{r}
+p_ord_NMDS_f <- plot_ordination(ps_vaginal.prop, ord.nmds.bray_vaginal, color="infant", shape = "age_group")
+p_ord_NMDS_m <- plot_ordination(ps_penile.prop, ord.nmds.bray_penile, color="infant", shape = "age_group")
+
+p_ord_NMDS_vaginal <- p_ord_NMDS_f + theme_classic() + scale_color_manual(name = "Infant", values = c("cornflowerblue", "purple")) + scale_shape_manual(name = "Age group", values = c(18, 0, 1, 17)) + ggtitle(label = "Vaginal") + theme(plot.title = element_text(face = "bold"))
+
+p_ord_NMDS_penile <- p_ord_NMDS_m + theme_classic() + scale_color_manual(name = "Infant", values = c("cornflowerblue", "purple")) + scale_shape_manual(name = "Age group", values = c(16, 18, 0, 1, 17)) + ggtitle(label = "Penile") + theme(plot.title = element_text(face = "bold"))
+
+p_ord_NMDS_vaginal
+p_ord_NMDS_penile
+
+p_ord_vagpen_combo <- ggarrange(p_ord_NMDS_penile, p_ord_NMDS_vaginal, nrow = 1, labels = "auto")
+ggsave(plot = p_ord_vagpen_combo, "./Figures/VagPen_ord_combo.pdf", height = 4, width = 9, useDingbats = FALSE)
+```
+
+### PERMANOVA
+
+```{r}
+permanova.vaginal.age_group<-adonis(bray_vaginal ~ age_group, data=vaginal_dataset, permutations = 9999)
+permanova.vaginal.age_group$aov.tab
+
+permanova.penile.age_group<-adonis(bray_penile ~ age_group, data=penile_dataset, permutations = 9999)
+permanova.penile.age_group$aov.tab
+```
+
+
+* Pairwise post-hoc tests - Is there one (or more) age group(s) that is/are driving the differences  in penile samples?
+```{r}
+pairwise.adonis(bray_penile, penile_dataset$age_group)
+```
+#### PERMDISP
+
+```{r}
+df_penile <- as(sample_data(ps_penile.prop), "data.frame")
+groups_penile <- df_penile[["age_group"]]
+groups_penile
+mod_penile <- betadisper(bray_penile, groups_penile, bias.adjust = TRUE, sqrt.dist = FALSE, type = "centroid")
+disp_penile <- permutest(mod_penile, pairwise = TRUE)
+
+plot(mod_penile, col = c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF"), pch = c(16, 18, 0, 1, 17), seg.col = c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF"))
+boxplot(mod_penile, col = c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF"))
+
+df_vaginal <- as(sample_data(ps_vaginal.prop), "data.frame")
+groups_vaginal <- df_vaginal[["age_group"]]
+groups_vaginal
+mod_vaginal <- betadisper(bray_vaginal, bias.adjust = TRUE, sqrt.dist = FALSE, groups_vaginal, type = "centroid")
+disp_vaginal <- permutest(mod_vaginal, pairwise = TRUE)
+
+plot(mod_vaginal, col = c("#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF"), pch = c(18, 0, 1, 17), seg.col = c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF"))
+boxplot(mod_vaginal)
+```
+
+### Relative Abundance
+* Agglomerate before relative and differential abundance tests
+* agglomerate at the genus level
+
+```{r}
+ps_vaginal_glom <- tax_glom(ps_vaginal, "Genus", NArm = FALSE)
+ps_vaginal_glom
+
+ps_penile_glom <- tax_glom(ps_penile, "Genus", NArm = FALSE)
+ps_penile_glom
+```
+
+#### TOP ASVs VAGINAL SAMPLES
+
+* Compute
+```{r top otus, results='hide'}
+#compare genus level
+vaginal_comm<-as.matrix(t(otu_table(ps_vaginal_glom, taxa_are_rows=FALSE)))
+dim(vaginal_comm) #80 52
+rel_abun_vaginal<-sweep(vaginal_comm, 2, apply(vaginal_comm,2,sum), `/`)
+dim(rel_abun_vaginal) #80 52
+apply(rel_abun_vaginal,2,sum)
+dim(rel_abun_vaginal)[1]->t
+#apply(rel_abun_vaginal,1,sum)
+order(apply(rel_abun_vaginal,1,sum))[(t-9):t]
+top10_asvs_vaginal<-names(apply(rel_abun_vaginal,1,sum)[order(apply(rel_abun_vaginal,1,sum))[(t-9):t]])
+
+#for genus level comparison:
+taxa_vaginal_glom <- data.frame(tax_table(ps_vaginal_glom))
+taxa_vaginal_glom[top10_asvs_vaginal,]->top10_taxa_vaginal
+row.names(top10_taxa_vaginal)<-c(length(row.names(top10_taxa_vaginal)):1)
+paste("asv_",row.names(top10_taxa_vaginal),sep="")->row.names(top10_taxa_vaginal)
+
+# Test for changes in relative abundance in dominant taxa
+rel_abun_top10_asvs_vaginal<-rel_abun_vaginal[top10_asvs_vaginal,]
+row.names(rel_abun_top10_asvs_vaginal)<-row.names(top10_taxa_vaginal)
+rel_abun_top10_asvs_vaginal<-t(rel_abun_top10_asvs_vaginal)
+rel_abun_top10_asvs_vaginal<-as.data.frame(rel_abun_top10_asvs_vaginal)
+rel_abun_top10_asvs_vaginal$sample_ID<-row.names(rel_abun_top10_asvs_vaginal)
+```
+
+```{r, results='hide'}
+#relative abundance by age_group
+vaginal_dataset$age_group[as.factor(row.names(rel_abun_top10_asvs_vaginal))]->rel_abun_top10_asvs_vaginal$age_group
+
+#relative abundance by infant
+vaginal_dataset$infant[as.factor(row.names(rel_abun_top10_asvs_vaginal))]->rel_abun_top10_asvs_vaginal$infant
+melt_rel_abun_top10_asvs_vaginal<-melt(rel_abun_top10_asvs_vaginal)
+
+vaginal_dataset$old[as.factor(row.names(rel_abun_top10_asvs_vaginal))]->rel_abun_top10_asvs_vaginal$old
+
+melt_rel_abun_top10_asvs_vaginal<-melt(rel_abun_top10_asvs_vaginal)
+
+#kruskal-wallace test for differences by age_group
+for (i in 1:10){
+  print(colnames(rel_abun_top10_asvs_vaginal[i]))
+  print(kruskal.test(rel_abun_top10_asvs_vaginal[,i] ~ age_group, data=rel_abun_top10_asvs_vaginal))
+  print(dunnTest(rel_abun_top10_asvs_vaginal[,i] ~ age_group, data=rel_abun_top10_asvs_vaginal, method="bh"))
+}
+
+```
+
+###### Print top 10 ASVs for vaginal samples:
+```{r}
+top10_taxa_vaginal
+```
+
+###### Plot variation in relative abundance across age groups for top 10 ASVs
+```{r}
+# better labels
+asv_labels_vaginal <- c("Lachnospiraceae\ngen.", "Campylobacter", "Streptobacillus", "Fusobacterium", "Corynebacterium 1", "Lactobacillus", "Corynebacterium", "Prevotella 9", "Actinobacillus", "Porphyromonas")
+
+# Graph for top 10 asvs by age_group
+p_top10_vaginal<-ggplot(melt_rel_abun_top10_asvs_vaginal, aes(variable, value*100, fill= age_group))+theme_classic()+
+  geom_boxplot(alpha=0.8, outlier.size = 0.5)+
+  xlab("")+ylab("Relative abundance (%)")+
+  theme(axis.text.x  = element_text(size = 8, face = "italic", color="black", angle=-50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold"),
+        axis.title.y  = element_text(size=10, color="black"),
+        legend.position = "bottom") + 
+  ylim(0,40) +
+  scale_fill_manual(name="Age group",values=c("#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  #scale_color_manual(name="sample type",values=c("black","black","black","black","black","black"))+
+  stat_compare_means(label = "p.signif", hide.ns = TRUE) +
+  scale_x_discrete(labels = asv_labels_vaginal) +
+  ggtitle(label = "Vaginal")
+p_top10_vaginal
+```
+
+#### TOP ASVs PENILE SAMPLES
+
+* Compute
+```{r top otus, results='hide'}
+penile_comm<-as.matrix(t(otu_table(ps_penile_glom, taxa_are_rows=FALSE)))
+dim(penile_comm) #211 39
+rel_abun_penile<-sweep(penile_comm, 2, apply(penile_comm,2,sum), `/`)
+dim(rel_abun_penile) #211 39
+apply(rel_abun_penile,2,sum)
+dim(rel_abun_penile)[1]->t
+order(apply(rel_abun_penile,1,sum))[(t-9):t]
+top10_asvs_penile<-names(apply(rel_abun_penile,1,sum)[order(apply(rel_abun_penile,1,sum))[(t-9):t]])
+
+taxa_penile_glom <- data.frame(tax_table(ps_penile_glom))
+taxa_penile_glom[top10_asvs_penile,]->top10_taxa_penile
+row.names(top10_taxa_penile)<-c(length(row.names(top10_taxa_penile)):1)
+paste("asv_",row.names(top10_taxa_penile),sep="")->row.names(top10_taxa_penile)
+
+# Test for changes in relative abundance in dominant taxa
+rel_abun_top10_asvs_penile<-rel_abun_penile[top10_asvs_penile,]
+row.names(rel_abun_top10_asvs_penile)<-row.names(top10_taxa_penile)
+rel_abun_top10_asvs_penile<-t(rel_abun_top10_asvs_penile)
+rel_abun_top10_asvs_penile<-as.data.frame(rel_abun_top10_asvs_penile)
+rel_abun_top10_asvs_penile$sample_ID<-row.names(rel_abun_top10_asvs_penile)
+```
+
+```{r, results='hide'}
+#relative abundance by age_group
+penile_dataset$age_group[as.factor(row.names(rel_abun_top10_asvs_penile))]->rel_abun_top10_asvs_penile$age_group
+
+#relative abundance by infant
+penile_dataset$infant[as.factor(row.names(rel_abun_top10_asvs_penile))]->rel_abun_top10_asvs_penile$infant
+melt_rel_abun_top10_asvs_penile<-melt(rel_abun_top10_asvs_penile)
+
+#relative abundance by sex
+penile_dataset$sex[as.factor(row.names(rel_abun_top10_asvs_penile))]->rel_abun_top10_asvs_penile$sex
+
+penile_dataset$old[as.factor(row.names(rel_abun_top10_asvs_penile))]->rel_abun_top10_asvs_penile$old
+
+melt_rel_abun_top10_asvs_penile<-melt(rel_abun_top10_asvs_penile)
+
+#kruskal-wallace test for differences by age_group
+for (i in 1:10){
+  print(colnames(rel_abun_top10_asvs_penile[i]))
+  print(kruskal.test(rel_abun_top10_asvs_penile[,i] ~ age_group, data=rel_abun_top10_asvs_penile))
+  print(dunnTest(rel_abun_top10_asvs_penile[,i] ~ age_group, data=rel_abun_top10_asvs_penile, method="bh"))
+}
+
+compare_means(c(asv_10, asv_9, asv_8, asv_7, asv_6, asv_5, asv_4, asv_3, asv_2, asv_1) ~ age_group, rel_abun_top10_asvs_penile, method = "kruskal", p.adjust.method = "fdr")
+```
+
+###### Print top 10 ASVs for penile samples:
+```{r}
+top10_taxa_penile
+```
+
+###### Plot variation in relative abundance across age groups for top 10 ASVs
+```{r}
+# better labels
+asv_labels_penile <- c("Treponema 2", "Anaerococcus", "Lactobacillus", "Peptoniphilus",  "Corynebacterium 1", "Prevotella_9", "Campylobacter", "Ezakiella", "Corynebacterium", "Porphyromonas")
+
+# Graph for top 10 asvs by age_group
+p_top10_penile<-ggplot(melt_rel_abun_top10_asvs_penile, aes(variable, value*100, fill= age_group))+
+  theme_classic()+
+  geom_boxplot(alpha=0.8, outlier.size = 0.5)+
+  xlab("")+
+  ylab("Relative abundance (%)")+
+  theme(axis.text.x  = element_text(size = 8, face = "italic", color="black", angle=-50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold"),
+        axis.title.y  = element_text(size=10, color="black"), 
+        legend.position = "bottom") + 
+  scale_fill_manual(name="Age group",values=c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  stat_compare_means(label = "p.signif", hide.ns = TRUE) +
+  scale_x_discrete(labels = asv_labels_penile) +
+  ggtitle(label = "Penile")
+p_top10_penile
+
+```
+
+
+Combo top ten figure:
+```{r}
+p_top10_vagpen <- ggarrange(p_top10_vaginal, p_top10_penile, nrow = 1, labels = "auto")
+
+ggsave("./Figures/top10_vagpen_combo.pdf", p_top10_vagpen, height = 7, width = 16, useDingbats = FALSE)
+```
+
+
+### DESeq
+* Compute differentially abundant taxa in different age groups
+
+* Vaginal
+```{r}
+#transform phyloseq object to deseq object
+vaginal.ddseq = phyloseq_to_deseq2(ps_vaginal_glom, ~age_group)
+
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object (replaces 0s with 1s, I think)
+geoMeans = apply(counts(vaginal.ddseq), 1, gm_mean)
+vaginal.ddseq = estimateSizeFactors(vaginal.ddseq, geoMeans = geoMeans)
+vaginal.ddseq = DESeq(vaginal.ddseq, test="LRT", reduced = ~1)
+```
+
+* Create tables of the results of the pairwise tests
+```{r, results='hide'}
+alpha = 0.01
+
+### No significant results, can stop here
+res.vaginal2 = results(vaginal.ddseq, contrast = c("age_group", "<1-4", "5-9"))
+sigtab.vaginal2 = res.vaginal2[which(res.vaginal2$padj < alpha), ]
+sigtab.vaginal2 = cbind(as(sigtab.vaginal2, "data.frame"), as(tax_table(ps_vaginal_glom)[rownames(sigtab.vaginal2), ], "matrix"))
+
+res.vaginal3 = results(vaginal.ddseq, contrast = c("age_group", "5-9", "10-14"))
+sigtab.vaginal3 = res.vaginal3[which(res.vaginal3$padj < alpha), ]
+sigtab.vaginal3 = cbind(as(sigtab.vaginal3, "data.frame"), as(tax_table(ps_vaginal_glom)[rownames(sigtab.vaginal3), ], "matrix"))
+
+res.vaginal4 = results(vaginal.ddseq, contrast = c("age_group", "10-14", "≥15"))
+sigtab.vaginal4 = res.vaginal4[which(res.vaginal4$padj < alpha), ]
+sigtab.vaginal4 = cbind(as(sigtab.vaginal4, "data.frame"), as(tax_table(ps_vaginal_glom)[rownames(sigtab.vaginal4), ], "matrix"))
+
+```
+
+* Penile samples
+
+```{r}
+#transform phyloseq object to deseq object
+penile.ddseq = phyloseq_to_deseq2(ps_penile_glom, ~age_group)
+
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object (replaces 0s with 1s, I think)
+geoMeans = apply(counts(penile.ddseq), 1, gm_mean)
+penile.ddseq = estimateSizeFactors(penile.ddseq, geoMeans = geoMeans)
+penile.ddseq = DESeq(penile.ddseq, test="LRT", reduced = ~1)
+```
+
+* Create tables of the results of the pairwise tests
+```{r, results='hide'}
+alpha = 0.01
+
+res.penile1 = results(penile.ddseq, contrast = c("age_group", "<1", "1-4"))
+sigtab.penile1 = res.penile1[which(res.penile1$padj < alpha), ]
+sigtab.penile1 = cbind(as(sigtab.penile1, "data.frame"), as(tax_table(ps_penile_glom)[rownames(sigtab.penile1), ], "matrix"))
+
+res.penile2 = results(penile.ddseq, contrast = c("age_group", "1-4", "5-9"))
+sigtab.penile2 = res.penile2[which(res.penile2$padj < alpha), ]
+sigtab.penile2 = cbind(as(sigtab.penile2, "data.frame"), as(tax_table(ps_penile_glom)[rownames(sigtab.penile2), ], "matrix"))
+
+res.penile3 = results(penile.ddseq, contrast = c("age_group", "5-9", "10-14"))
+sigtab.penile3 = res.penile3[which(res.penile3$padj < alpha), ]
+sigtab.penile3 = cbind(as(sigtab.penile3, "data.frame"), as(tax_table(ps_penile_glom)[rownames(sigtab.penile3), ], "matrix"))
+
+res.penile4 = results(penile.ddseq, contrast = c("age_group", "10-14", "≥15"))
+sigtab.penile4 = res.penile4[which(res.penile4$padj < alpha), ]
+sigtab.penile4 = cbind(as(sigtab.penile4, "data.frame"), as(tax_table(ps_penile_glom)[rownames(sigtab.penile4), ], "matrix"))
+
+
+# replace Genus names with numbers with clean name to make figure less messy and replace names for families with unknown genera
+levels(sigtab.penile1$Genus) <- c(levels(sigtab.penile1$Genus), "Lachnospiraceae AC2044 group", "Absconditabacteriales (SR1) fam.", "Bacteroidales fam.", "Clostridiales Family_XI")
+sigtab.penile1$Genus[grep("Lachnospiraceae_AC2044_",sigtab.penile1$Genus)] = "Lachnospiraceae AC2044 group"
+sigtab.penile1$Genus[grep("Absconditabacteriales", sigtab.penile1$Order)] = "Absconditabacteriales (SR1) fam."
+sigtab.penile1$Genus[grep("Bacteroidales", sigtab.penile1$Order)] = "Bacteroidales fam."
+sigtab.penile1$Genus[grep("Family_XI", sigtab.penile1$Family)] = "Clostridiales Family_XI"
+
+levels(sigtab.penile2$Genus) <- c(levels(sigtab.penile2$Genus), "Lachnospiraceae AC2044 group", "Absconditabacteriales (SR1) fam.", "Bacteroidales fam.", "Clostridiales Family_XI", "Corynebacteriaceae gen.")
+sigtab.penile2$Genus[grep("Lachnospiraceae_AC2044_",sigtab.penile2$Genus)] = "Lachnospiraceae AC2044 group"
+sigtab.penile2$Genus[grep("Absconditabacteriales", sigtab.penile2$Order)] = "Absconditabacteriales (SR1) fam."
+sigtab.penile2$Genus[grep("Bacteroidales", sigtab.penile2$Order)] = "Bacteroidales fam."
+sigtab.penile2$Genus[grep("Family_XI", sigtab.penile2$Family)] = "Clostridiales Family_XI"
+sigtab.penile2$Genus[grep("424.3", sigtab.penile2$baseMean)] = "Corynebacteriaceae gen."
+
+levels(sigtab.penile4$Genus) <- c(levels(sigtab.penile4$Genus), "Lachnospiraceae AC2044 group", "Christensenellaceae R-7 group", "Absconditabacteriales (SR1) fam.", "Bacteroidales fam.", "Clostridiales Family_XI")
+sigtab.penile4$Genus[grep("Lachnospiraceae_AC2044_",sigtab.penile4$Genus)] = "Lachnospiraceae AC2044 group"
+sigtab.penile4$Genus[grep("Christensenellaceae_R-7_",sigtab.penile4$Genus)] = "Christensenellaceae R-7 group"
+sigtab.penile4$Genus[grep("Absconditabacteriales", sigtab.penile4$Order)] = "Absconditabacteriales (SR1) fam."
+sigtab.penile4$Genus[grep("Bacteroidales", sigtab.penile4$Order)] = "Bacteroidales fam."
+sigtab.penile4$Genus[grep("Family_XI", sigtab.penile4$Family)] = "Clostridiales Family_XI"
+
+#head(sigtab.penile)
+```
+* info about analysis
+
+Number of taxa that are differentially expressed - 5
+```{r}
+dim(sigtab.penile2)
+mcols(res.penile2, use.names = TRUE)
+```
+
+#### logfold change of differentially abundant taxa in infant macaques
+```{r}
+theme_set(theme_classic())
+
+#subset data to only keep OTUs with more than +2 or -2 log2FoldChange
+sigtab.penile1 <- subset(sigtab.penile1, sigtab.penile1$log2FoldChange <= -2 | sigtab.penile1$log2FoldChange >= 2)
+sigtab.penile2 <- subset(sigtab.penile2, sigtab.penile2$log2FoldChange <= -2 | sigtab.penile2$log2FoldChange >= 2)
+sigtab.penile3 <- subset(sigtab.penile3, sigtab.penile3$log2FoldChange <= -2 | sigtab.penile3$log2FoldChange >= 2)
+sigtab.penile4 <- subset(sigtab.penile4, sigtab.penile4$log2FoldChange <= -2 | sigtab.penile4$log2FoldChange >= 2)
+
+# Phylum order
+x = tapply(sigtab.penile1$log2FoldChange, sigtab.penile1$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.penile1$Phylum = factor(as.character(sigtab.penile1$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.penile1$log2FoldChange, sigtab.penile1$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.penile1$Genus = factor(as.character(sigtab.penile1$Genus), levels=names(x))
+
+# Phylum order
+x = tapply(sigtab.penile2$log2FoldChange, sigtab.penile2$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.penile2$Phylum = factor(as.character(sigtab.penile2$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.penile2$log2FoldChange, sigtab.penile2$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.penile2$Genus = factor(as.character(sigtab.penile2$Genus), levels=names(x))
+
+# Phylum order
+x = tapply(sigtab.penile3$log2FoldChange, sigtab.penile3$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.penile3$Phylum = factor(as.character(sigtab.penile3$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.penile3$log2FoldChange, sigtab.penile3$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.penile3$Genus = factor(as.character(sigtab.penile3$Genus), levels=names(x))
+
+# Phylum order
+x = tapply(sigtab.penile4$log2FoldChange, sigtab.penile4$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.penile4$Phylum = factor(as.character(sigtab.penile4$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.penile4$log2FoldChange, sigtab.penile4$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.penile4$Genus = factor(as.character(sigtab.penile4$Genus), levels=names(x))
+
+
+p_penile_DiffExp1 <- ggplot(sigtab.penile1, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "Penile", subtitle = "<1 vs. 1-4 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        axis.title.y = element_text(size = 10),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top",
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8)) + 
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top")) +
+  xlab(NULL) + 
+  scale_x_discrete(labels = wrap_format(26)) +
+  scale_color_manual(name = "Phylum", values = c("#FEE090", "#4575B4", "#A50026", "#313695", "#ABD9E9", "mediumorchid"))
+
+p_penile_DiffExp2 <- ggplot(sigtab.penile2, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "", subtitle = "1-4 vs. 5-9 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top",
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8)) + 
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top")) +
+  xlab(NULL) + 
+  scale_x_discrete(labels = wrap_format(26)) +
+  scale_color_manual(name = "Phylum", values = c("#A50026", "#FEE090", "mediumorchid", "#ABD9E9", "#313695", "#4575B4"))
+
+p_penile_DiffExp3 <- ggplot(sigtab.penile3, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "", subtitle = "5-9 vs. 10-14 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top",
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8)) + 
+  scale_x_discrete(labels = c("Acinetobacter", "Clostridiales\nFamily_XI")) +
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top", nrow = 1)) + 
+  xlab(NULL) + 
+  scale_color_manual(name = "Phylum", values = c("#FEE090", "#4575B4"))
+
+p_penile_DiffExp4 <- ggplot(sigtab.penile4, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) + 
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  ggtitle(label = "", subtitle = "10-14 vs. ≥15 years old") +
+  theme(axis.text.x = element_text(size = 8, face = "italic", color="black", angle = -50, hjust = 0, vjust=0.5),
+        axis.text.y = element_text(size = 10),
+        plot.title = element_text(face = "bold"),
+        legend.position = "top",
+        legend.title = element_text(size = 9),
+        legend.text = element_text(size = 8)) + 
+  guides(color = "none", size = guide_legend(title = "mean normalized count", title.position = "top")) +
+  xlab(NULL) + 
+  scale_x_discrete(labels = wrap_format(26)) +
+  scale_color_manual(name = "Phylum", values = c("#4575B4", "#FEE090", "#A50026", "#ABD9E9", "#313695", "mediumorchid"))
+
+p_penile_DiffExp1
+p_penile_DiffExp2
+p_penile_DiffExp3
+p_penile_DiffExp4
+
+```
+
+Combo penile DESeq figure:
+```{r}
+p_penile_DESeq <- ggarrange(p_penile_DiffExp1, p_penile_DiffExp2, p_penile_DiffExp3, p_penile_DiffExp4, nrow = 2, ncol = 2, labels = "auto", align = "hv")
+```
+
+
+Comparison of vaginal and penile composition:
+
+Source function for summarizing taxa across variables:
+```{r}
+source("./SummarizeTaxa_function.R")
+```
+
+Run function on each body site
+```{r}
+sum_tax_vaginal <- summarize_taxa(ps_vaginal, "Phylum", "sex")
+sum_tax_penile <- summarize_taxa(ps_penile, "Phylum", "sex")
+
+#join outputs
+sum_tax_all_sex <- rbind(sum_tax_vaginal, sum_tax_penile)
+```
+
+Combine low abundance taxa into one group
+```{r}
+sum_tax_all_sex$Phylum[sum_tax_all_sex$meanRA < 0.001] <- "<1% abund."
+```
+
+#### Relative abundances of phyla across the two sexes
+```{r}
+spatial_plot <- ggplot(data=sum_tax_all_sex, aes(x=sex, y=meanRA*100, fill=Phylum))
+spatial_plot <- spatial_plot + 
+  geom_bar(aes(), stat="identity") + 
+  ylab("mean relative abundance (%)") + 
+  xlab(NULL) + 
+  scale_x_discrete(labels = c("vaginal", "penile")) +
+  scale_fill_manual(values = c("cyan2", "#3B9AB2", "#78B7C5", "#D73027", "slategray", wes_palette("Zissou1")[3],"#FEE090",  wes_palette("Zissou1")[4], "#E0F3F8", "#ABD9E9", "coral", "royalblue4", "deepskyblue3", "darkorchid4","seagreen","pink","coral", "steelblue2","slategray", "black", "gold2","orchid", "blue")) + 
+  theme_classic() + 
+  theme(legend.position="bottom") + 
+  guides(fill=guide_legend(nrow=3, reverse = TRUE)) + 
+  coord_flip()
+
+spatial_plot
+
+#export as PDF
+ggsave(plot = spatial_plot, "./Figures/RelAbundance_plot_genital.pdf", width = 9, height = 4, units = "in")
+```
+
+### PiCrust2, FunkyTax & LEfSE
+
+KEGG pathways
+```{r}
+KEGG_info <- read.delim("../pathway_mapfiles/KEGG_pathways_info.tsv", header = FALSE, row.names = 1)
+```
+
+Source updated CatFun function:
+```{r}
+source("./Updated_CatFun_function.R")
+```
+
+Data for FunkyTax:
+```{r}
+write.csv(vaginal_dataset, "./PiCrust2_in/vaginal_dataset_FunkyTax.csv")
+write.csv(penile_dataset, "./PiCrust2_in/penile_dataset_FunkyTax.csv")
+```
+
+#### FunkyTax
+
+##### Vaginal
+
+Read in the PiCrust2 output file "pred_metagenome_unstrat.tsv" and round
+```{r}
+vaginalCountMatrix <- read.delim("./PiCrust2_out/vaginal_pred_metagenome_unstrat.tsv")
+vaginalCountMatrix <- round_df(vaginalCountMatrix, digits = 0)
+```
+
+Read in vaginal dataset (if not already in environment):
+```{r}
+vaginal_dataset <- read.csv("./PiCrust2_in/vaginal_dataset_FunkyTax.csv", header = TRUE, row.names = 1)
+```
+
+Make DESeq dds object
+```{r}
+vaginal_dds_in <- DESeqDataSetFromMatrix(countData=vaginalCountMatrix, colData=vaginal_dataset, design=~age_group, tidy = TRUE)
+```
+
+Run DESeq to identify Genes/Functions that are differentially expressed between age groups. 
+* Use LRT test to compare multiple groups
+```{r}
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object
+geoMeans = apply(counts(vaginal_dds_in), 1, gm_mean)
+vaginal_dds_in = estimateSizeFactors(vaginal_dds_in, geoMeans = geoMeans)
+
+vaginal_dds_out <- DESeq(vaginal_dds_in, test = "LRT", reduced = ~1)
+```
+
+* From DESeq results, pairwise comparisons between age groups are made
+```{r}
+res.vaginal.dds_out1 = results(vaginal_dds_out, contrast = c("age_group", "<1-4", "5-9" ))
+#res.vaginal.dds_out2 = results(vaginal_dds_out, contrast = c("age_group", "1-4", "5-9"))
+res.vaginal.dds_out3 = results(vaginal_dds_out, contrast = c("age_group", "5-9", "10-14"))
+res.vaginal.dds_out4 = results(vaginal_dds_out, contrast = c("age_group", "10-14", "≥15"))
+
+alpha = 0.01
+
+# keep only significant results
+sigtab.vaginal.dds_out1 = res.vaginal.dds_out1[which(res.vaginal.dds_out1$padj < alpha), ]
+#sigtab.vaginal.dds_out2 = res.vaginal.dds_out2[which(res.vaginal.dds_out2$padj < alpha), ]
+#sigtab.vaginal.dds_out3 = res.vaginal.dds_out3[which(res.vaginal.dds_out3$padj < alpha), ]
+#sigtab.vaginal.dds_out4 = res.vaginal.dds_out4[which(res.vaginal.dds_out4$padj < alpha), ]
+```
+
+* Number of pathways (KEGG genes) that are different
+```{r}
+dim(sigtab.vaginal.dds_out1)
+```
+
+##### CatFun for vaginal Samples
+
+Compares DESeq and TaFuR results and categorizes pathways as one of the following:
+Conserved (ns for both) - Frequency of function and contributing community does not differ among groups
+Equivalent (ns DESeq, sig TaFuR) - Frequency of function does not differ among groups but contributing community differs
+Enhanced (sig DESeq, ns TaFuR) - Frequency of function differs among groups but contributing community does not
+Divergent (sig for both) - Frequency of function and contributing community differs among groups
+
+* load TaFuR output
+```{r}
+vaginal_TaFuR <- readRDS("./PiCrust2_out/vaginal_TaFuR_out.rds")
+```
+
+* run CatFun
+```{r}
+vaginal_CatFun <- CatFun2(vaginal_TaFuR, res.vaginal.dds_out1, alpha = 0.01)
+```
+
+* Visualize
+```{r}
+p_vaginal_CatFun <- vaginal_CatFun[[1]]
+p_vaginal_CatFun <- p_vaginal_CatFun + 
+  ggtitle(label = "Vaginal", subtitle = "n = 5938") +
+  theme(plot.title = element_text(face = "bold"),
+        title = element_text(size = 10))
+
+p_vaginal_CatFun
+```
+
+##### Penile
+Read in the PiCrust2 output file "pred_metagenome_unstrat.tsv" and round
+```{r}
+penileCountMatrix <- read.delim("./PiCrust2_out/penile_pred_metagenome_unstrat.tsv")
+penileCountMatrix <- round_df(penileCountMatrix, digits = 0)
+```
+
+Read in penile dataset (if not already in environment):
+```{r}
+penile_dataset <- read.csv("./PiCrust2_in/penile_dataset_FunkyTax.csv", header = TRUE, row.names = 1)
+```
+
+Make DESeq dds object
+```{r}
+penile_dds_in <- DESeqDataSetFromMatrix(countData=penileCountMatrix, colData=penile_dataset, design=~age_group, tidy = TRUE)
+```
+
+Run DESeq to identify Genes/Functions that are differentially expressed between age groups. 
+* Use LRT test to compare multiple groups
+```{r}
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object
+geoMeans = apply(counts(penile_dds_in), 1, gm_mean)
+penile_dds_in = estimateSizeFactors(penile_dds_in, geoMeans = geoMeans)
+
+penile_dds_out <- DESeq(penile_dds_in, test = "LRT", reduced = ~1)
+```
+
+* From DESeq results, pairwise comparisons between age groups are made
+```{r}
+res.penile.dds_out1 = results(penile_dds_out, contrast = c("age_group", "<1", "1-4" ))
+
+alpha = 0.01
+
+# keep only significant results
+sigtab.penile.dds_out1 = res.penile.dds_out1[which(res.penile.dds_out1$padj < alpha), ]
+```
+
+##### CatFun for penile Samples
+
+Compares DESeq and TaFuR results and categorizes pathways as one of the following:
+Conserved (ns for both) - Frequency of function and contributing community does not differ among groups
+Equivalent (ns DESeq, sig TaFuR) - Frequency of function does not differ among groups but contributing community differs
+Enhanced (sig DESeq, ns TaFuR) - Frequency of function differs among groups but contributing community does not
+Divergent (sig for both) - Frequency of function and contributing community differs among groups
+
+* load TaFuR output
+```{r}
+penile_TaFuR <- readRDS("./PiCrust2_out/penile_TaFuR_out.rds")
+```
+
+
+* run CatFun
+```{r}
+penile_CatFun <- CatFun2(penile_TaFuR, res.penile.dds_out1, alpha = 0.01)
+```
+
+* Visualize
+```{r}
+p_penile_CatFun <- penile_CatFun[[1]]
+p_penile_CatFun <- p_penile_CatFun + 
+  ggtitle(label = "Penile", subtitle = "n = 6192") +
+  theme(plot.title = element_text(face = "bold"),
+        title = element_text(size = 10))
+
+p_penile_CatFun
+```
+
+#### PiCrust2 ordinations & PERMANOVA
+
+##### Vaginal
+
+#### PiCrust2 output formatting
+Use PiCrust2 pathway output
+```{r}
+vaginal_PiCrust_pathways <- read.delim("./PiCrust2_out/vaginal_path_abun_unstrat.tsv", sep = "\t", header = TRUE, stringsAsFactors = TRUE, row.names = 1)
+```
+
+Make phyloseq object and transform to relative abundances
+```{r}
+ps_pw_vaginal <- phyloseq(sample_data(vaginal_dataset), otu_table(as.matrix(vaginal_PiCrust_pathways), taxa_are_rows = TRUE), tax_table(as.matrix(KEGG_info)))
+
+ps_pw_vaginal_prop <- transform_sample_counts(ps_pw_vaginal, function(otu) otu/sum(otu))
+```
+
+Calculate distances and ordination
+```{r}
+bray_pw_vaginal <- distance(ps_pw_vaginal_prop, method = "bray")
+ord.bray_pw_vaginal <- ordinate(ps_pw_vaginal_prop, method = "NMDS", distance = "bray")
+```
+
+Plot
+```{r}
+vaginal_ord_pw <- plot_ordination(ps_pw_vaginal_prop, ord.bray_pw_vaginal, color = "infant", shape = "age_group")
+
+p_ord_vaginal_pw <- vaginal_ord_pw + theme_classic() +
+  scale_color_manual(name = "Infant", values = c("cornflowerblue", "purple")) + 
+  scale_shape_manual(name = "Age group", values = c(18, 0, 1, 17)) +
+  ggtitle(label = "Vaginal", subtitle = "Predicted functional features") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_ord_vaginal_pw
+```
+
+#### PERMANOVA
+* Do predicted pathway abundances vary across age groups?
+```{r}
+permanova.vaginal.pw.age_group<-adonis(bray_pw_vaginal ~ age_group, data=vaginal_dataset, permutations = 9999)
+permanova.vaginal.pw.age_group$aov.tab
+```
+
+#### LEfSe
+* Use LEfSe to look for features most likely to explain differences between age groups
+
+make relative abundance matrix from picrust pathway output
+```{r}
+vaginal_pw_rel_abun <- as.data.frame(otu_table(ps_pw_vaginal_prop, taxa_are_rows=TRUE))
+```
+
+Add metadata rows to table, as required by LEfSe
+```{r}
+metadata <- select(vaginal_dataset, sample_ID, age_group)
+metadata <- as.data.frame(t(metadata), stringsAsFactors=FALSE)
+
+LEfSE_in_vaginal_pw <- rbind.data.frame(metadata, vaginal_pw_rel_abun)
+```
+
+Write to txt file for use outside of R
+* create LEfSe folder and body site folder to keep things organized
+```{r}
+write.table(LEfSE_in_vaginal_pw, "./LEfSe/vaginal/vaginal_PiCrust2_pathways_LEfSe.txt", quote = FALSE, sep = "\t", col.names = FALSE)
+```
+
+Use command-line version of LEfSe to run, using the following commands
+```{bash}
+# format input file (for age group comparison)
+format_input.py ./LEfSe/vaginal/vaginal_PiCrust2_pathways_LEfSe.txt ./LEfSe/vaginal/vaginal_PiCrust2_pathways_LEfSe.in -c 2 -u 1 -o 1000000
+
+# run LEfSe (on age group comparison)
+run_lefse.py ./LEfSe/vaginal/vaginal_PiCrust2_pathways_LEfSe.in ./LEfSe/vaginal/vaginal_PiCrust2_pathways_LEfSe.res -a 0.01 -w 0.01
+
+# default plot (doesn't like special symbols, like ≥)
+plot_res.py ./LEfSe/vaginal/vaginal_PiCrust2_pathways_LEfSe.res ./LEfSe/vaginal/vaginal_PiCrust2_pathways_LEfSe.png
+```
+
+### Make better plot for LEfSe results
+```{r}
+# read in results
+vaginal_LEfSe_res <- read.delim("./LEfSe/vaginal/vaginal_PiCrust2_pathways_LEfSe.res", sep = "\t", header = FALSE)
+
+# merge with pathway info
+vaginal_LEfSe_res <- merge(vaginal_LEfSe_res, KEGG_info, by.x = "V1", by.y = "row.names")
+vaginal_LEfSe_res <- select(vaginal_LEfSe_res, -V3.y)
+
+vaginal_LEfSe_res <- vaginal_LEfSe_res %>% drop_na(V4.x)
+```
+
+Plot (if significant results to plot)
+```{r}
+p_vaginal_LDA <- ggplot(vaginal_LEfSe_res
+       %>% mutate(V3.x = factor(V3.x, levels=c("<1-4","5-9","10-14","≥15")))
+       %>% arrange(V3.x, desc(V4.x)) 
+       %>% mutate(V2.y = factor(V2.y, levels = V2.y)), 
+       aes(V4.x, V2.y, fill = V3.x)) + 
+  geom_col(width = 0.5) +
+  theme_classic() +
+  ylab(NULL) +
+  xlab("LDA Score (log 10)") +
+  scale_fill_manual(name = "Age group", values = c("#088BBE", "#172869", "#F6A1A5", "#1BB6AF")) +
+  guides(fill = guide_legend(reverse = TRUE)) +
+  ggtitle(label = "Vaginal") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_vaginal_LDA
+```
+
+##### Penile
+
+#### PiCrust2 output formatting
+Use PiCrust2 pathway output
+```{r}
+penile_PiCrust_pathways <- read.delim("./PiCrust2_out/penile_path_abun_unstrat.tsv", sep = "\t", header = TRUE, stringsAsFactors = TRUE, row.names = 1)
+```
+
+Make phyloseq object and transform to relative abundances
+```{r}
+ps_pw_penile <- phyloseq(sample_data(penile_dataset), otu_table(as.matrix(penile_PiCrust_pathways), taxa_are_rows = TRUE), tax_table(as.matrix(KEGG_info)))
+
+ps_pw_penile_prop <- transform_sample_counts(ps_pw_penile, function(otu) otu/sum(otu))
+```
+
+Calculate distances and ordination
+```{r}
+bray_pw_penile <- distance(ps_pw_penile_prop, method = "bray")
+ord.bray_pw_penile <- ordinate(ps_pw_penile_prop, method = "NMDS", distance = "bray")
+```
+
+Plot
+```{r}
+penile_ord_pw <- plot_ordination(ps_pw_penile_prop, ord.bray_pw_penile, color = "infant", shape = "age_group")
+
+p_ord_penile_pw <- penile_ord_pw + theme_classic() +
+  scale_color_manual(name = "Infant", values = c("cornflowerblue", "purple")) + 
+  scale_shape_manual(name = "Age group", values = c(16, 18, 0, 1, 17)) +
+  ggtitle(label = "Penile", subtitle = "Predicted functional features") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_ord_penile_pw
+```
+
+#### PERMANOVA
+* Do predicted pathway abundances vary across age groups?
+```{r}
+permanova.penile.pw.age_group<-adonis(bray_pw_penile ~ age_group, data=penile_dataset, permutations = 9999)
+permanova.penile.pw.age_group$aov.tab
+```
+Pairwise post-hoc PERMANOVA
+Which age group is driving differences?
+```{r}
+pairwise.adonis(bray_pw_penile, penile_dataset$age_group)
+```
+
+### LEfSe
+* Use LEfSe to look for features most likely to explain differences between age groups
+
+make relative abundance matrix from picrust pathway output
+```{r}
+penile_pw_rel_abun <- as.data.frame(otu_table(ps_pw_penile_prop, taxa_are_rows=TRUE))
+```
+
+Add metadata rows to table, as required by LEfSe
+```{r}
+metadata <- select(penile_dataset, sample_ID, age_group)
+metadata <- as.data.frame(t(metadata), stringsAsFactors=FALSE)
+
+LEfSE_in_penile_pw <- rbind.data.frame(metadata, penile_pw_rel_abun)
+```
+
+Write to txt file for use outside of R
+* use separate folder to keep things organized
+```{r}
+write.table(LEfSE_in_penile_pw, "./LEfSe/penile/penile_PiCrust2_pathways_LEfSe.txt", quote = FALSE, sep = "\t", col.names = FALSE)
+```
+
+Use command-line version of LEfSe to run, using the following commands
+```{bash}
+# format input file (for age group comparison)
+format_input.py ./LEfSe/penile/penile_PiCrust2_pathways_LEfSe.txt ./LEfSe/penile/penile_PiCrust2_pathways_LEfSe.in -c 2 -u 1 -o 1000000
+
+# run LEfSe (on age group comparison)
+run_lefse.py ./LEfSe/penile/penile_PiCrust2_pathways_LEfSe.in ./LEfSe/penile/penile_PiCrust2_pathways_LEfSe.res -a 0.01 -w 0.01
+
+# default plot (doesn't like special symbols, like ≥)
+plot_res.py ./LEfSe/penile/penile_PiCrust2_pathways_LEfSe.res ./LEfSe/penile/penile_PiCrust2_pathways_LEfSe.png
+```
+
+### Make better plot for LEfSe results
+```{r}
+# read in results
+penile_LEfSe_res <- read.delim("./LEfSe/penile/penile_PiCrust2_pathways_LEfSe.res", sep = "\t", header = FALSE)
+
+# merge with pathway info
+penile_LEfSe_res <- merge(penile_LEfSe_res, KEGG_info, by.x = "V1", by.y = "row.names")
+penile_LEfSe_res <- select(penile_LEfSe_res, -V3.y)
+
+penile_LEfSe_res <- penile_LEfSe_res %>% drop_na(V4.x)
+```
+
+Plot (no significant results to plot)
+```{r}
+p_penile_LDA <- ggplot(penile_LEfSe_res
+       %>% mutate(V3.x = factor(V3.x, levels=c("<1","1-4","5-9","10-14","≥15")))
+       %>% arrange(V3.x, desc(V4.x)) 
+       %>% mutate(V2.y = factor(V2.y, levels = V2.y)), 
+       aes(V4.x, V2.y, fill = V3.x)) + 
+  geom_col(width = 0.5) +
+  theme_classic() +
+  ylab(NULL) +
+  xlab("LDA Score (log 10)") +
+  scale_fill_manual(name = "Age group", values = c("#088BBE", "#172869", "#F8CD9C", "#F6A1A5", "#1BB6AF")) +
+  guides(fill = F) +
+  ggtitle(label = "Penile") +
+  theme(plot.title = element_text(face = "bold"))
+
+p_penile_LDA
+```
+
+Combo LDA figure
+```{r}
+p_LDA_vagpen <- ggarrange(p_vaginal_LDA, p_penile_LDA, ncol = 1, heights = c(0.2, 0.8), align = "v", labels = "auto")
+
+ggsave("./Figures/VagPen_LDA_combo.pdf", p_LDA_vagpen, height = 7, width = 7, useDingbats = FALSE)
+```
+

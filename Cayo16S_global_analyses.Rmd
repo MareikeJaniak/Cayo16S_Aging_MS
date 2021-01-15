@@ -1,0 +1,757 @@
+---
+title: "Cayo 16S Global Analyses"
+output:
+  html_document:
+    code_folding: hide
+---
+
+### BASIC ANALYSES OF ALL SAMPLES COMBINED
+
+**Downstream analyses - the dada2Code markdown file should be run first to generate the necessary input files**
+
+* Load libraries
+```{r packages, results='hide'}
+x<-c("ggplot2", "dada2", "vegan", "tidyr","car","DESeq2", "phyloseq","FSA", "lme4", "ggpubr", "reshape2", "decontam", "wesanderson", "LaCroixColoR")
+lapply(x, require, character.only = TRUE)
+```
+
+* Load seqtab and taxa from dada2 pipeline
+```{r}
+seqtab.nochim <- readRDS("./seqtab.nochim_Cayo16S.rds")
+taxa <- read.csv("./taxaGF.csv", row.names = 1)
+```
+
+* Load metadata
+
+##### For all analyses, I created variables to group individuals by age, whether they were infants, or old. 
+Age groups are set as follows by age in years: <1, 1-4, 5-9, 10-14, ≥15
+I chose these divisions because I wanted roughly equal groups and ranges, but also wanted to distinguish infants. They also align with age groups used in previous research on aging in the Cayo Santiago macaques. 
+For the infant variable, only individuals <1 year old are included. 
+For the old variable, only individuals ≥15 are included. 
+
+```{r}
+dataset <- read.csv("./Cayo16S_metadata_Aging_MS.txt",header=T,row.names = 1)
+
+quant_data <- read.delim("./Cayo16S_copy_number_data.tsv", header = T)
+quant_data <- quant_data$copy_number
+
+dataset$sample_ID <- rownames(dataset)
+
+dataset <- cbind(dataset, quant_data)
+
+dataset$sample_ID <- rownames(dataset)
+
+dataset$control <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$sample_type[i]== "negcontrol"){
+    dataset$control[i] <- "Yes"
+  }
+  if (dataset$sample_type[i]== "poscontrol"){
+    dataset$control[i] <- "Yes"
+  }
+}
+
+dataset$age[is.na(dataset$age)] <- -1
+
+dataset$infant <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 0){
+    dataset$infant[i] <- "Yes"
+  }
+}
+
+dataset$age_group <- "<1"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 1| dataset$age[i] == 2| dataset$age[i] == 3 | dataset$age[i] == 4){
+    dataset$age_group[i] <- "1-4"
+  }
+  else if (dataset$age[i] == 5| dataset$age[i] == 6| dataset$age[i] == 7 | dataset$age[i] == 8 | dataset$age[i] == 9){
+    dataset$age_group[i] <- "5-9"
+  }
+  else if (dataset$age[i] == 10 | dataset$age[i] == 11| dataset$age[i] == 12 | dataset$age[i] == 13 | dataset$age[i] == 14){
+    dataset$age_group[i] <- "10-14"
+  }
+  else if (dataset$age[i] == 15| dataset$age[i] >= 15){
+    dataset$age_group[i] <- "≥15"
+  }
+  else if (dataset$age[i] == -1){
+    dataset$age_group[i] <- NA
+  }
+}
+
+dataset$age_group[is.na(dataset$age_group)] <- "other"
+
+dataset$old <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] >= 15){
+    dataset$old[i] <- "Yes"
+  }
+}
+
+dataset[dataset==-1] <- NA
+
+dataset$sex <- as.character(dataset$sex)
+```
+
+* Create phyloseq object and filtered phyloseq object
+```{r}
+ps <- phyloseq(otu_table(as.matrix(seqtab.nochim), taxa_are_rows = FALSE), 
+               sample_data(dataset), 
+               tax_table(as.matrix(taxa)))
+```
+
+### Decontamination
+
+#### Inspect Library Sizes
+
+Let’s take a quick first look at the library sizes (i.e. the number of reads) in each sample, as a function of whether that sample was a true positive sample or a negative/positive control:
+
+* All data
+```{r}
+df <- as.data.frame(sample_data(ps)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=control)) + geom_point()
+```
+
+#### Identify Contaminants - Frequency
+
+The first contaminant identification method we’ll use is the “frequency” method. In this method, the distribution of the frequency of each sequence feature as a function of the input DNA concentration is used to identify contaminants.
+
+```{r}
+contamdf.freq <- isContaminant(ps, method="frequency", conc="quant_data")
+head(contamdf.freq)
+```
+
+This calculation has returned a data.frame with several columns, the most important being $p which containts the probability that was used for classifying contaminants, and $contaminant which contains TRUE/FALSE classification values with TRUE indicating that the statistical evidence that the associated sequence feature is a contaminant exceeds the user-settable threshold. As we did not specify the threshold, the default value of threshold = 0.1 was used, and $contaminant=TRUE if $p < 0.1.
+```{r}
+table(contamdf.freq$contaminant)
+head(which(contamdf.freq$contaminant))
+```
+
+In this plot the dashed black line shows the model of a noncontaminant sequence feature for which frequency is expected to be independent of the input DNA concentration. The red line shows the model of a contaminant sequence feature, for which frequency is expected to be inversely proportional to input DNA concentration, as contaminating DNA will make up a larger fraction of the total DNA in samples with very little total DNA. 
+
+```{r}
+plot_frequency(ps, taxa_names(ps)[which(contamdf.freq$contaminant)], conc="quant_data") + 
+  xlab("DNA Concentration (qPCR (molecules/ul))")
+```
+
+Remove contaminants and controls for further analyses:
+```{r}
+ps <- prune_taxa(!contamdf.freq$contaminant, ps)
+
+ps <- subset_samples(ps, control != "Yes")
+dataset <- subset(dataset, control != "Yes")
+ps <- prune_taxa(taxa_sums(ps) > 0, ps)
+ps
+```
+
+Remove samples with fewer than 2000 reads for further analyses:
+```{r}
+df_sample_sums <- as.data.frame(apply(seqtab.nochim,1,sum))
+rownames(df_sample_sums)[which(df_sample_sums$"apply(seqtab.nochim, 1, sum)" <= 2000)]
+```
+
+```{r}
+ps <- subset_samples(ps, sample_ID != "MB000053" & sample_ID != "MB000150" & sample_ID != "MB000185" & sample_ID != "MB000186" & sample_ID != "MB000205" & sample_ID != "MB000217" & sample_ID != "MB102071" & sample_ID != "MB103805" & sample_ID != "MB103960" & sample_ID != "MB103963" & sample_ID != "MB105080" & sample_ID != "MB200011" & sample_ID != "MB200015")
+
+dataset <- subset(dataset, sample_ID != "MB000053" & sample_ID != "MB000150" & sample_ID != "MB000185" & sample_ID != "MB000186" & sample_ID != "MB000205" & sample_ID != "MB000217" & sample_ID != "MB102071" & sample_ID != "MB103805" & sample_ID != "MB103960" & sample_ID != "MB103963" & sample_ID != "MB105080" & sample_ID != "MB200011" & sample_ID != "MB200015")
+
+ps <- prune_taxa(taxa_sums(ps) > 0, ps)
+ps
+```
+
+Save filtered phyloseq object for later (create folder to keep things organized):
+```{r}
+saveRDS(ps, "./PhyloseqObjects/ps_global.rds")
+```
+
+
+If picking up analyses again, oad global phyloseq object if not currently loaded:
+```{r}
+ps <- readRDS("./PhyloseqObjects/ps_global.rds")
+```
+
+
+### Obtaining basic stats to report in methods.
+
+```{r stats sequences, results='hide'}
+apply(seqtab.nochim,1,sum) # view per sample number of sequences
+```
+
+##### Total number of sequences and mean, min, and max per sample
+```{r}
+sum(apply(seqtab.nochim,1,sum)) # total number of sequences in our study
+summary(apply(seqtab.nochim,1,sum)) # get mean, min, and max of number of sequences per sample
+```
+
+##### Histogram of distribution of the number of sequences per samples
+```{r}
+hist(apply(seqtab.nochim,1,sum)) # see histogram of nb of sequences per sample distribution
+```
+
+* Compute total Number of ASVs and mean, min, and max per sample
+```{r ASVs stats, results='hide'}
+pa_matrix<-decostand(seqtab.nochim,method="pa")
+apply(pa_matrix,1,sum) # view per sample number of ASVs
+```
+
+###### Histogram of number of samples that include all ASVs
+```{r}
+hist(apply(pa_matrix,2,sum)) # nb of samples that include the ASVs
+```
+
+```{r, results='hide'}
+stem(apply(pa_matrix,2,sum)) # nb of samples that include the ASVs
+```
+
+#### Mean, min, and max number of ASVs per sample and histogram of distribution
+```{r}
+summary(apply(pa_matrix,1,sum)) # get mean, min, and max of number of ASVs per sample
+hist(apply(pa_matrix,1,sum)) # see histogram of nb of ASVs per sample distribution
+```
+
+
+### Alpha-diversity (Shannon) vs. species richness (Chao1)
+* Calculate with unfiltered (but decontaminated) datasets to retain singletons!
+
+* Compute CHAO1 and Shannon Index
+```{r computation, results='hide'}
+adiv<-estimate_richness(ps,measures=c("Observed","Shannon","Chao1"))
+adiv <- subset(adiv, rownames(adiv) %in% rownames(dataset))
+dataset$alphadiv<-adiv$Shannon
+hist(dataset$alphadiv)
+dataset$chao1<-adiv$Chao1
+hist(dataset$chao1)
+dataset$evenness<-adiv$Shannon/log(adiv$Observed)
+```
+
+* Boxplots
+
+* Change order of x-axis for boxplots and create new column that splits genital samples into vaginal and penile based on sex of the host:
+```{r}
+dataset$sample_type <- factor(dataset$sample_type, levels = c("buccal", "genital", "rectal"))
+dataset$sample_type2 <- as.character(dataset$sample_type)
+
+dataset$sample_type2[dataset$sex == "m"] <- "penile"
+dataset$sample_type2[dataset$sex == "f"] <- "vaginal"
+dataset$sample_type2[dataset$sample_type == "rectal"] <- "rectal"
+dataset$sample_type2[dataset$sample_type == "buccal"] <- "buccal"
+
+dataset$sample_type2 <- factor(dataset$sample_type2, levels = c("buccal", "penile", "vaginal", "rectal"))
+```
+
+
+##### CHAO1
+```{r}
+p1<-ggplot(dataset, aes(sample_type, chao1,fill=sample_type, color=sample_type)) +
+  theme_bw()+
+  geom_boxplot(alpha=1)+geom_jitter(width=0.1) +
+  xlab("Sample Type")+ylab("SPECIES RICHNESS (Chao1)")+
+  theme(axis.text.x  = element_text(size=12, color="black"),
+        axis.text.y  = element_text(size=12, color="black"),
+        axis.title.x  = element_text(size=14, color="black",face="bold"),
+        axis.title.y  = element_text(size=14, color="black",face="bold"))+
+  scale_fill_manual(name="Sample Type",values=c("royalblue4","dodgerblue","purple","red", "cornflowerblue", "coral" )) +
+  scale_color_manual(name="Sample Type",values=c("black","black","black","black","black","black")) +
+  guides(fill=F,color=F) + 
+  stat_compare_means()
+p1
+```
+
+##### Shannon Index
+```{r}
+p_shannon_global<-ggplot(dataset, aes(sample_type2, alphadiv,fill=sample_type2)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.8, outlier.shape = NA)+
+  geom_jitter(width=0.1, height = 0) +
+  xlab("Sample type")+
+  ylab("Alpha-diversity (Shannon Index)") +
+  scale_fill_manual(name="sample_type", values=c("#1BB6AF", "#8eb2d5", "#e7797a", "#172869")) +
+  scale_x_discrete(labels = c("oral", "penile", "vaginal", "rectal")) +
+  guides(fill=F,color=F) + 
+  stat_compare_means()
+p_shannon_global
+```
+
+
+### Taxonomic Filtering
+
+*following alpha diversity calculations, we can filter the data more aggressively
+
+Create a table of number of features for each Phylum present in the dataset
+```{r}
+rank_names(ps)
+table(tax_table(ps)[, "Phylum"], exclude = NULL)
+```
+
+Remove features with NA or ambiguous phylum annotation from dataset:
+```{r}
+ps_global <- subset_taxa(ps, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+ps_global
+```
+
+Remove features that are present less than 2 times in fewer than 10 of the samples:
+```{r}
+ps_global_filtered <- filter_taxa(ps_global, function(x) sum(x>2) > 10, TRUE)
+ps_global_filtered
+```
+
+Save phyloseq objects for later use:
+```{r}
+saveRDS(ps_global_filtered, "./PhyloseqObjects/ps_global_filtered.rds")
+```
+
+Read in filtered phyloseq object:
+```{r}
+ps_global_filtered <- readRDS("./PhyloseqObjects/ps_global_filtered.rds")
+
+#If necessary pdate metadata that splits genital samples into vaginal and penile:
+new_sample_data <- phyloseq::sample_data(dataset)
+sample_data(ps_global_filtered) <- new_sample_data
+```
+
+
+### Beta-diversity (aka community structure/composition)
+
+* Compute
+```{r betadiv, results='hide'}
+# Create function geo means for Variance Stabilizing Transformation
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+
+# Variance Stabilizing Transformation
+test.phyloseq.dds<-phyloseq_to_deseq2(ps_global_filtered,~sample_type)
+test.phyloseq.dds = estimateSizeFactors(test.phyloseq.dds, geoMeans = apply(counts(test.phyloseq.dds), 1, gm_mean))
+vst.blind <- DESeq2::varianceStabilizingTransformation(test.phyloseq.dds, blind=TRUE)
+vst.blind.Mat <- SummarizedExperiment::assay(vst.blind) # Extract transformed OTU table
+vst.blind.Mat<-t(vst.blind.Mat)
+vst.blind.Mat[which(vst.blind.Mat<0)]<-0
+dists <- dist(t(assay(vst.blind)))
+
+# Ordination (from DADA2 tutorial)
+ps.prop <- transform_sample_counts(ps_global_filtered, function(otu) otu/sum(otu))
+bray_global <- phyloseq::distance(ps.prop, method = "bray")
+ord.nmds.bray <- ordinate(ps.prop, method="NMDS", distance="bray")
+
+ps.rectal <- subset_samples(ps_global_filtered, sample_type=rectal)
+ps.rectal <- prune_taxa(taxa_sums(ps.rectal) > 0, ps.rectal)
+ps.prop.rectal <- transform_sample_counts(ps.rectal, function(otu) otu/sum(otu))
+bray_global.rectal <- phyloseq::distance(ps.prop.rectal, method = "bray")
+ord.nmds.bray.rectal <- ordinate(ps.prop, method="NMDS", distance="bray")
+
+
+# Computing Bray-Curtis Dissimilarities and PCoA
+comm.vst.blind.Mat <- vegdist(vst.blind.Mat, "bray")
+PCoA.comm.vst.blind.Mat<-capscale(comm.vst.blind.Mat~1,distance="bray")
+PCoA.comm.vst.blind.Mat$CA$eig[1:3]/sum(PCoA.comm.vst.blind.Mat$CA$eig)
+PCoA.comm.vst.blind.Mat
+eig <- PCoA.comm.vst.blind.Mat$CA$eig
+
+# Portion of total vraiation in community structure explained by each of the main three components
+eig[1]/sum(abs(eig)) 
+eig[2]/sum(abs(eig)) 
+eig[3]/sum(abs(eig)) 
+
+# Save scores in dataset tables
+row.names(dataset)==row.names(scores(PCoA.comm.vst.blind.Mat)$sites)
+dataset$PCoA1<-scores(PCoA.comm.vst.blind.Mat)$sites[,1]
+dataset$PCoA2<-scores(PCoA.comm.vst.blind.Mat)$sites[,2]
+```
+
+* Plot
+
+###### Ordination with NMDS
+```{r}
+p_ord_global <- plot_ordination(ps.prop, ord.nmds.bray, color="sample_type2") 
+p_ord_global <- p_ord_global + 
+  scale_color_manual(name = "Sample type", labels = c("oral", "penile", "vaginal", "rectal"), values = c("#1BB6AF", "#8eb2d5", "#e7797a", "#172869")) + 
+  theme_classic() +
+  theme(legend.position = c(0.8, 0.8)) +
+  annotate("text", x = 1, y = -1.8, label = paste("'PERMANOVA, '~r^2 ==~'0.404, '~p =='1e-04'"), parse = TRUE)
+p_ord_global
+```
+
+###### PCoA plot of all samples
+```{r}
+PCA_global <- qplot(PCoA1, PCoA2, xlab="PCoA1",
+              ylab="PCoA2", color=sample_type, data=(dataset)) + scale_color_manual(name = "Sample Type", values = c("royalblue4","dodgerblue","purple")) + theme_classic()
+
+PCA_global <- PCA_global + theme(legend.position = c(0.9, 0.8))
+
+PCA_global
+```
+
+
+#### PERMANOVA
+
+40.4% of the variance is explained by sample type (which part of the body was swabbed), not surprising!
+```{r}
+# Uses DESeq distances. May be discouraged? I used calculation below.
+permanova<-adonis(comm.vst.blind.Mat ~ sample_type, data=dataset, permutations = 9999)
+permanova$aov.tab
+
+# Uses distances from Bray-Curtis used in NMDS plot
+permanova<-adonis(bray_global ~ sample_type2, data=dataset, permutations = 9999)
+permanova$aov.tab
+```
+
+### Agglomerate before relative and differential abundance tests
+* agglomerate at the genus level
+
+```{r}
+ps_global_glom <- tax_glom(ps_global, "Genus", NArm = TRUE)
+ps_global_glom
+```
+
+### Relative abundances across sample type
+
+#### Define function to summarize by taxa:
+From https://github.com/joey711/phyloseq/issues/418
+```{r}
+library("phyloseq")
+library("data.table")
+library("ggplot2")
+
+fast_melt = function(physeq){
+  # supports "naked" otu_table as `physeq` input.
+  otutab = as(otu_table(physeq), "matrix")
+  if(!taxa_are_rows(physeq)){otutab <- t(otutab)}
+  otudt = data.table(otutab, keep.rownames = TRUE)
+  setnames(otudt, "rn", "taxaID")
+  # Enforce character taxaID key
+  otudt[, taxaIDchar := as.character(taxaID)]
+  otudt[, taxaID := NULL]
+  setnames(otudt, "taxaIDchar", "taxaID")
+  # Melt count table
+  mdt = melt.data.table(otudt, 
+                        id.vars = "taxaID",
+                        variable.name = "SampleID",
+                        value.name = "count")
+  # Remove zeroes, NAs
+  mdt <- mdt[count > 0][!is.na(count)]
+  # Calculate relative abundance
+  mdt[, RelativeAbundance := count / sum(count), by = SampleID]
+  if(!is.null(tax_table(physeq, errorIfNULL = FALSE))){
+    # If there is a tax_table, join with it. Otherwise, skip this join.
+    taxdt = data.table(as(tax_table(physeq, errorIfNULL = TRUE), "matrix"), keep.rownames = TRUE)
+    setnames(taxdt, "rn", "taxaID")
+    # Enforce character taxaID key
+    taxdt[, taxaIDchar := as.character(taxaID)]
+    taxdt[, taxaID := NULL]
+    setnames(taxdt, "taxaIDchar", "taxaID")
+    # Join with tax table
+    setkey(taxdt, "taxaID")
+    setkey(mdt, "taxaID")
+    mdt <- taxdt[mdt]
+  }
+  return(mdt)
+}
+
+summarize_taxa = function(physeq, Rank, GroupBy = NULL){
+  Rank <- Rank[1]
+  if(!Rank %in% rank_names(physeq)){
+    message("The argument to `Rank` was:\n", Rank,
+            "\nBut it was not found among taxonomic ranks:\n",
+            paste0(rank_names(physeq), collapse = ", "), "\n",
+            "Please check the list shown above and try again.")
+  }
+  if(!is.null(GroupBy)){
+    GroupBy <- GroupBy[1]
+    if(!GroupBy %in% sample_variables(physeq)){
+      message("The argument to `GroupBy` was:\n", GroupBy,
+              "\nBut it was not found among sample variables:\n",
+              paste0(sample_variables(physeq), collapse = ", "), "\n",
+              "Please check the list shown above and try again.")
+    }
+  }
+  # Start with fast melt
+  mdt = fast_melt(physeq)
+  if(!is.null(GroupBy)){
+    # Add the variable indicated in `GroupBy`, if provided.
+    sdt = data.table(SampleID = sample_names(physeq),
+                     var1 = get_variable(physeq, GroupBy))
+    setnames(sdt, "var1", GroupBy)
+    # Join
+    setkey(sdt, SampleID)
+    setkey(mdt, SampleID)
+    mdt <- sdt[mdt]
+  }
+  # Summarize
+  # Summarize
+Nsamples = nsamples(physeq)
+  summarydt = mdt[, list(meanRA = sum(RelativeAbundance)/Nsamples,
+                         sdRA = sd(RelativeAbundance),
+                         minRA = min(RelativeAbundance),
+                         maxRA = max(RelativeAbundance)),
+                  by = c(Rank, GroupBy)]
+  return(summarydt)
+}
+
+plot_taxa_summary = function(physeq, Rank, GroupBy = NULL){
+  # Get taxa summary table 
+  dt1 = summarize_taxa(physeq, Rank = Rank, GroupBy = GroupBy)
+  # Set factor appropriately for plotting
+  RankCol = which(colnames(dt1) == Rank)
+  setorder(dt1, -meanRA)
+  dt1[, RankFac := factor(dt1[[Rank]], 
+                          levels = rev(dt1[[Rank]]))]
+  dt1[, ebarMax := max(c(0, min(meanRA + sdRA))), by = eval(Rank)]
+  dt1[, ebarMin := max(c(0, min(meanRA - sdRA))), by = eval(Rank)]
+  # Set zeroes to one-tenth the smallest value
+  ebarMinFloor = dt1[(ebarMin > 0), min(ebarMin)]
+  ebarMinFloor <- ebarMinFloor / 10
+  dt1[(ebarMin == 0), ebarMin := ebarMinFloor]
+
+  pRank = ggplot(dt1, aes(x = meanRA, y = RankFac)) +
+    scale_x_log10() +
+    xlab("Mean Relative Abundance") +
+    ylab(Rank) +
+    theme_bw()
+  if(!is.null(GroupBy)){
+    # pRank <- pRank + facet_wrap(facets = as.formula(paste("~", GroupBy)))
+    pRank <- pRank + geom_point(mapping = aes_string(colour = GroupBy),
+                                size = 5)
+  } else {
+    # Don't include error bars for faceted version
+    pRank <- pRank + geom_errorbarh(aes(xmax = ebarMax,
+                                        xmin = ebarMin))
+  }
+  return(pRank)
+}
+
+```
+
+Run function on phyloseq object for each sample type and join outputs:
+(Requires generating these objects first with the respective markdown files)
+```{r}
+#read in ps objects for each sample type
+ps_rectal_stack <- readRDS("./PhyloseqObjects/ps_rectal.rds")
+ps_buccal_stack <- readRDS("./PhyloseqObjects/ps_buccal.rds")
+ps_penile_stack <- readRDS("./PhyloseqObjects/ps_penile.rds")
+ps_vaginal_stack <- readRDS("./PhyloseqObjects/ps_vaginal.rds")
+
+#change sample type to penile and vaginal, instead of genital
+sample_data(ps_vaginal_stack)$sample_type <- factor("vaginal")
+sample_data(ps_penile_stack)$sample_type <- factor("penile")
+
+#run function on each
+sum_tax_rectal <- summarize_taxa(ps_rectal_stack, "Phylum", "sample_type")
+sum_tax_vaginal <- summarize_taxa(ps_vaginal_stack, "Phylum", "sample_type")
+sum_tax_penile <- summarize_taxa(ps_penile_stack, "Phylum", "sample_type")
+sum_tax_buccal <- summarize_taxa(ps_buccal_stack, "Phylum", "sample_type")
+
+#join outputs
+sum_tax_all <- rbind(sum_tax_buccal, sum_tax_rectal)
+sum_tax_all <- rbind(sum_tax_all, sum_tax_vaginal)
+sum_tax_all <- rbind(sum_tax_all, sum_tax_penile)
+```
+
+Combine low abundance taxa into one group
+```{r}
+sum_tax_all$Phylum[sum_tax_all$meanRA < 0.001] <- "<1% abund."
+```
+
+Change order of sample types for plot
+```{r}
+sum_tax_all$sample_type <- factor(sum_tax_all$sample_type, levels = c("buccal", "vaginal", "penile", "rectal"))
+```
+
+#### Relative abundances of phyla across the three sample types
+```{r}
+spatial_plot <- ggplot(data=sum_tax_all, aes(x=sample_type, y=meanRA*100, fill=Phylum))
+spatial_plot <- spatial_plot + geom_bar(aes(), stat="identity") + ylab("mean relative abundance (%)") + xlab(NULL) + scale_fill_manual(values = c("cyan2", "#3B9AB2", "#78B7C5", "#D73027", "slategray", wes_palette("Zissou1")[3], "#FDAE61","#FEE090",  wes_palette("Zissou1")[4], "#E0F3F8", wes_palette("Zissou1")[5],"#ABD9E9", "#4575B4", "coral", "royalblue4", "deepskyblue3", "darkorchid4","seagreen","pink","coral", "steelblue2","slategray", "black", "gold2","orchid", "blue")) + theme_classic() + theme(legend.position="bottom") + guides(fill=guide_legend(nrow=3, reverse = TRUE)) + coord_flip()
+
+spatial_plot
+```
+
+*Export as PDF
+Create a folder for Figures to keep things organized.
+```{r}
+ggsave(plot = spatial_plot, "./Figures/RelAbundance_plot.pdf", width = 9, height = 5, units = "in")
+```
+
+### Figures for final manuscript
+
+*Many of these objects are created in the other markdown files with the body site specific analyses. Run those first, before creating these figures.
+
+New figure 1:
+```{r}
+p_fig1_combo <- ggarrange(ggarrange(p_infant_shannon_rectal, p_infant_shannon_buccal, p_infant_shannon_penile, p_young_shannon_vaginal, 
+                                    ncol = 4, labels = "auto"), 
+                          ggarrange(p_shannon_global, p_ord_global, 
+                                    ncol=2, labels = c("e", "f")), 
+                          ggarrange(p_ord_NMDS_rectal, p_ord_NMDS_buccal, p_ord_NMDS_penile, p_ord_NMDS_vaginal, 
+                                    ncol = 4, common.legend = TRUE, legend = "bottom", labels = c("g", "h", "i", "j")), 
+                          ncol = 1)
+
+
+ggsave(plot = p_fig1_combo, "./Figures/Fig1_combo.pdf", width = 11, height = 10, units = "in", useDingbats = FALSE)
+```
+
+New Figure 2:
+```{r}
+p_fig2_combo <- ggarrange(ggarrange(p_top10_rectal_inf, p_top10_buccal_inf, 
+                                    labels = c("a", "b"),
+                                    nrow = 1, common.legend  = TRUE, 
+                                    legend = "right", align = "h"),
+                          ggarrange(p_top10_vaginal, p_top10_penile, 
+                                    labels = c("c", "d"),
+                                    nrow = 1, common.legend  = TRUE, 
+                                    legend = "right", align = "h"),
+                          ncol = 1, nrow = 2)
+
+p_fig2_combo
+
+ggsave(plot = p_fig2_combo, "./Figures/Fig2_combo.pdf", width = 12, height = 8, units = "in", useDingbats = FALSE)
+```
+
+Diff Exp combo figure:
+```{r}
+p_DiffExp_combo <- ggarrange(ggarrange(p_rectal_DiffExp1, 
+                                       p_rectal_DiffExp2, 
+                                       p_rectal_DiffExp3, 
+                                       p_rectal_DiffExp4, 
+                                       ncol = 4, align = "h", widths = c(0.44,0.19,0.18,0.19)),
+                             ggarrange(p_buccal_DiffExp1, 
+                                       legend_DiffExp, 
+                                       ncol = 2),
+                             ggarrange(p_penile_DiffExp1, 
+                                       p_penile_DiffExp2, 
+                                       p_penile_DiffExp3, 
+                                       p_penile_DiffExp4, 
+                                       ncol = 4, align = "h", widths = c(0.28, 0.28, 0.16, 0.28)),
+                             nrow = 3, heights = c(0.36, 0.28, 0.36), labels = "auto")
+
+ggsave(plot = p_DiffExp_combo, "./Figures/DiffExp_pw_combo.pdf", width = 12, height = 13, units = "in", useDingbats = FALSE)
+```
+
+
+### Supplemental figures:
+
+Sex differences in genital samples combo figure:
+```{r}
+p_genital_sex_combo <- ggarrange(ggarrange(p_ord_NMDS_genital_sex, 
+                                           p_top10_genital_sex, 
+                                           nrow = 1, common.legend = TRUE, legend = "right", widths = c(0.4,0.5), 
+                                           align = "h", labels = c("","b")), 
+                                 p_DiffExp_genital_sex, nrow = 2, labels = c("a","c"))
+
+ggsave(plot = p_genital_sex_combo, "./Figures/genital_sex_combo.pdf", width = 8, height = 8, units = "in", useDingbats = FALSE)
+```
+
+Sex differences in shannon index:
+```{r}
+p_alpha_SexDiff <- ggarrange(p3_sex_rectal, p3_sex_buccal, p3_sex_genital, ncol = 3, labels = "auto")
+p_alpha_SexDiff
+
+#export as PDF
+ggsave(plot = p_alpha_SexDiff, "./Figures/SexDiff_alphadiv.pdf", width = 8, height = 4, units = "in", useDingbats = FALSE)
+```
+
+Shannon index across age groups:
+```{r}
+p_shannon_age_groups_combo <- ggarrange(p_age_shannon_rectal, p_age_shannon_buccal, p_age_shannon_penile, p_age_shannon_vaginal, ncol = 1, labels = "auto")
+p_shannon_age_groups_combo
+
+#export as PDF
+ggsave(plot = p_shannon_age_groups_combo, "./Figures/Age_groups_alphadiv_combo.pdf", width = 7, height = 12, units = "in", useDingbats=FALSE)
+```
+
+Shannon index for old and non-old macaques:
+```{r}
+p_shannon_old_combo <- ggarrange(p_shannon_rectal_old, p_old_shannon_buccal, p_shannon_penile_old, p_shannon_vaginal_old, ncol = 4, labels = "auto")
+p_shannon_old_combo
+
+#export as PDF
+ggsave(plot = p_shannon_old_combo, "./Figures/Old_alphadiv.pdf", width = 9, height = 4, units = "in", useDingbats = FALSE)
+```
+
+Top 10 genera across age groups & old:
+```{r}
+p_top10_age_combo <- ggarrange(ggarrange(p_top10_rectal, p_top10_buccal,
+                                         nrow = 1, align = "h", common.legend = TRUE, legend = "right", labels = "auto"),
+                               ggarrange(p_top10_rectal_old, p_top10_buccal_old, 
+                                         nrow = 1, align = "h", common.legend = TRUE, legend = "right", labels = c("c", "d")),
+                               nrow = 2)
+p_top10_age_combo
+
+#export as PDF
+ggsave(plot = p_top10_age_combo, "./Figures/top10_age_groups_combo.pdf", width = 12, height = 10, units = "in", useDingbats = FALSE)
+```
+
+Top 10 genera infant vs. not infant:
+```{r}
+p_top10_infant_combo <- ggarrange(p_top10_rectal_inf, p_top10_buccal_inf, ncol = 1, common.legend = TRUE, legend = "right", labels = "auto")
+
+#export as PDF
+ggsave(plot = p_top10_infant_combo, "./Figures/top10_infant_combo.pdf", width = 8, height = 8, units = "in", useDingbats = FALSE)
+```
+
+Top 10 asvs old vs not old:
+```{r}
+p_top10_old_combo <- ggarrange(p_top10_rectal_old, p_top10_buccal_old, ncol = 1, common.legend = TRUE, legend = "right", labels = "auto")
+p_top10_old_combo
+
+#export as PDF
+ggsave(plot = p_top10_old_combo, "./Figures/top10_old_combo.pdf", width = 8, height = 8, units = "in", useDingbats = FALSE)
+```
+
+Differential expression OLD macaques:
+```{r}
+p_DiffExp_old_combo <- ggarrange(p_DiffExp_old_rectal, p_DiffExp_old_buccal, ncol = 1, labels = "auto")
+p_DiffExp_old_combo
+
+#export as PDF
+#ggsave(plot = p_DiffExp_old_combo, "/Users/Mareike/Documents/Data/Cayo_microbiome/Analysis/Figures/DiffExp_old_combo.pdf", width = 8, height = 8, units = "in", useDingbats = FALSE)
+```
+
+Differential Expression of taxa - pairwise comparisons of older age groups:
+```{r}
+p_DiffExp_pw_combo <- ggarrange(ggarrange(p_rectal_DiffExp2, p_rectal_DiffExp3, p_rectal_DiffExp4, ncol = 3), 
+                                ggarrange(p_genital_DiffExp2, p_genital_DiffExp3, p_genital_DiffExp4, ncol = 3), nrow = 2, labels = c("rectal", "genital"))
+
+p_DiffExp_pw_combo
+
+#ggsave(plot = p_DiffExp_pw_combo, "/Users/Mareike/Documents/Data/Cayo_microbiome/Analysis/Figures/DiffExp_pw_agegroups_combo.pdf", width = 10, height = 6, units = "in", useDingbats = FALSE)
+```
+
+Supplemental male vs female genital figure:
+```{r}
+p_genital_supp_combo <- ggarrange(spatial_plot, p_DiffExp_genital_sex, nrow = 2, labels = "auto")
+
+ggsave("./Figures/genital_combo_suppl.pdf", p_genital_supp_combo, height = 8, width = 8, useDingbats = FALSE)
+```
+
+PiCrust2 Supplemental Figures:
+```{r}
+p_rectal_picrust_combo <- ggarrange(rectal_functions_diff1, 
+                                    ggarrange(rectal_functions_diff2, 
+                                              rectal_functions_diff4, 
+                                              ncol = 2, labels = c("","c")), 
+                                    nrow = 2, heights = c(0.7, 0.3), labels = "auto")
+
+ggsave(plot = p_rectal_picrust_combo, "./Figures/rectal_picrust2_combo.pdf", height = 15, width = 17, useDingbats = FALSE)
+```
+
+```{r}
+p_genital_picrust_combo <- ggarrange(ggarrange(genital_functions_diff1,
+                                     genital_functions_diff3, widths = c(0.4, 0.6)),
+                                     genital_functions_diff4,
+                                     nrow = 2)
+
+ggsave(plot = p_genital_picrust_combo, "./Figures/genital_picrust2_combo.pdf", height = 8, width = 10, useDingbats = FALSE)
+```
+
+```{r}
+p_buccal_picrust_combo <- ggarrange(buccal_functions_diff1, 
+                                    ggarrange(buccal_functions_diff2,
+                                              buccal_functions_diff4, ncol = 2), 
+                                    heights = c(0.6, 0.4), nrow = 2)
+
+ggsave(plot = p_buccal_picrust_combo, "../../Figures/buccal_picrust2_combo.pdf", height = 13, width = 14, useDingbats = FALSE)
+```
+
+

@@ -1,0 +1,730 @@
+---
+title: "Cayo 16S Genital Analyses"
+output:
+  html_document:
+    code_folding: hide
+---
+
+### GENITAL SAMPLES SEPARATELY
+
+**Downstream analyses - the dada2Code markdown file should be run first to generate the necessary input files**
+
+**Note that many of these analyses were repeated separately for vaginal and penile samples, see the genital_by_sex markdown file**
+
+* Load libraries
+```{r packages, results='hide'}
+x<-c("ggplot2", "dada2", "vegan", "tidyr","car","DESeq2", "phyloseq","FSA", "lme4", "ggpubr", "reshape2", "decontam", "pairwiseAdonis", "wesanderson", "LaCroixColoR")
+lapply(x, require, character.only = TRUE)
+```
+
+* Load seqtab, otu table, and taxa from dada2 pipeline
+```{r}
+seqtab.nochim <- readRDS("./seqtab.nochim_Cayo16S.rds")
+taxa <- read.csv("./taxaGF.csv", row.names = 1)
+```
+
+* Load metadata
+```{r}
+dataset <- read.csv("./Cayo16S_metadata_Aging_MS.txt",header=T,row.names = 1)
+quant_data <- read.delim("./Cayo16S_copy_number_data.tsv", header = T)
+quant_data <- quant_data$copy_number
+
+dataset$sample_ID <- rownames(dataset)
+
+dataset <- cbind(dataset, quant_data)
+
+dataset$control <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$sample_type[i]== "negcontrol"){
+    dataset$control[i] <- "Yes"
+  }
+  if (dataset$sample_type[i]== "poscontrol"){
+    dataset$control[i] <- "Yes"
+  }
+}
+
+dataset$age[is.na(dataset$age)] <- -1
+
+dataset$infant <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 0){
+    dataset$infant[i] <- "Yes"
+  }
+}
+
+dataset$age_group <- "<1"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] == 1| dataset$age[i] == 2| dataset$age[i] == 3 | dataset$age[i] == 4){
+    dataset$age_group[i] <- "1-4"
+  }
+  else if (dataset$age[i] == 5| dataset$age[i] == 6| dataset$age[i] == 7 | dataset$age[i] == 8 | dataset$age[i] == 9){
+    dataset$age_group[i] <- "5-9"
+  }
+  else if (dataset$age[i] == 10 | dataset$age[i] == 11| dataset$age[i] == 12 | dataset$age[i] == 13 | dataset$age[i] == 14){
+    dataset$age_group[i] <- "10-14"
+  }
+  else if (dataset$age[i] == 15| dataset$age[i] >= 15){
+    dataset$age_group[i] <- "≥15"
+  }
+  else if (dataset$age[i] == -1){
+    dataset$age_group[i] <- NA
+  }
+}
+
+dataset$age_group[is.na(dataset$age_group)] <- "other"
+
+dataset$old <- "No"
+for (i in 1:length(dataset$sample_type)){
+  if (dataset$age[i] >= 15){
+    dataset$old[i] <- "Yes"
+  }
+}
+
+dataset[dataset==-1] <- NA
+
+dataset$sex <- as.character(dataset$sex)
+```
+
+* Create genital phyloseq subset and dataset for genital metadata
+```{r}
+ps <- phyloseq(otu_table(as.matrix(seqtab.nochim), taxa_are_rows = FALSE), 
+               sample_data(dataset), 
+               tax_table(as.matrix(taxa)))
+
+ps_genital <- subset_samples(ps, sample_type == "genital" | sample_ID == "NegCtrl3")
+genital_dataset <- subset(dataset, sample_type == "genital" | sample_ID == "NegCtrl3")
+```
+
+
+### Decontamination
+
+#### Inspect Library Sizes
+
+Let’s take a quick first look at the library sizes (i.e. the number of reads) in each sample, as a function of whether that sample was a true positive sample or a negative control:
+
+* All data
+```{r}
+df <- as.data.frame(sample_data(ps)) # Put sample_data into a ggplot-friendly data.frame
+df$LibrarySize <- sample_sums(ps)
+df <- df[order(df$LibrarySize),]
+df$Index <- seq(nrow(df))
+ggplot(data=df, aes(x=Index, y=LibrarySize, color=control)) + geom_point()
+```
+* genital only:
+
+```{r}
+df_genital <- as.data.frame(sample_data(ps_genital)) # Put sample_data into a ggplot-friendly data.frame
+df_genital$LibrarySize <- sample_sums(ps_genital)
+df_genital <- df_genital[order(df_genital$LibrarySize),]
+df_genital$Index <- seq(nrow(df_genital))
+ggplot(data=df_genital, aes(x=Index, y=LibrarySize, color=control)) + geom_point()
+```
+#### Identify Contaminants - Frequency
+
+The first contaminant identification method we’ll use is the “frequency” method. In this method, the distribution of the frequency of each sequence feature as a function of the input DNA concentration is used to identify contaminants.
+
+```{r}
+contamdf.freq <- isContaminant(ps_genital, method="frequency", conc="quant_data")
+head(contamdf.freq)
+```
+
+This calculation has returned a data.frame with several columns, the most important being $p which containts the probability that was used for classifying contaminants, and $contaminant which contains TRUE/FALSE classification values with TRUE indicating that the statistical evidence that the associated sequence feature is a contaminant exceeds the user-settable threshold. As we did not specify the threshold, the default value of threshold = 0.1 was used, and $contaminant=TRUE if $p < 0.1.
+```{r}
+table(contamdf.freq$contaminant)
+head(which(contamdf.freq$contaminant))
+```
+
+In this plot the dashed black line shows the model of a noncontaminant sequence feature for which frequency is expected to be independent of the input DNA concentration. The red line shows the model of a contaminant sequence feature, for which frequency is expected to be inversely proportional to input DNA concentration, as contaminating DNA will make up a larger fraction of the total DNA in samples with very little total DNA. 
+
+```{r}
+plot_frequency(ps_genital, taxa_names(ps_genital)[which(contamdf.freq$contaminant)], conc="quant_data") + 
+  xlab("DNA Concentration (qPCR (molecules/ul))")
+```
+
+Remove contaminants and negative control for further analyses:
+```{r}
+ps_genital <- prune_taxa(!contamdf.freq$contaminant, ps_genital)
+
+ps_genital <- subset_samples(ps_genital, sample_ID != "NegCtrl3")
+genital_dataset <- subset(genital_dataset, sample_ID != "NegCtrl3")
+```
+Remove samples with fewer than 2000 sequences:
+```{r}
+ps_genital <- prune_samples(sample_sums(ps_genital)>=2000, ps_genital)
+genital_dataset <- subset(genital_dataset, sample_ID != "MB103805" & sample_ID != "MB105080" & sample_ID != "MB102071" & sample_ID != "MB000217")
+ps_genital <- prune_taxa(taxa_sums(ps_genital) > 0, ps_genital)
+ps_genital
+```
+
+### Taxonomic Filtering
+create a table of number of features for each Phylum present in the dataset
+```{r}
+rank_names(ps_genital)
+table(tax_table(ps_genital)[, "Phylum"], exclude = NULL)
+```
+
+Remove features with NA or ambiguous phylum annotation from dataset:
+```{r}
+ps_genital <- subset_taxa(ps_genital, !is.na(Phylum) & !Phylum %in% c("", "uncharacterized"))
+ps_genital
+```
+
+A useful next step is to explore feature prevalence in the dataset, which we will define here as the number of samples in which a taxon appears at least once.
+```{r}
+# Compute prevalence of each feature, store as data.frame
+prevdf = apply(X = otu_table(ps_genital),
+               MARGIN = ifelse(taxa_are_rows(ps_genital), yes = 1, no = 2),
+               FUN = function(x){sum(x > 0)})
+# Add taxonomy and total read counts to this data.frame
+prevdf = data.frame(Prevalence = prevdf,
+                    TotalAbundance = taxa_sums(ps_genital),
+                    tax_table(ps_genital))
+```
+
+Are there phyla that are comprised of mostly low-prevalence features? Compute the total and average prevalences of the features in each phylum.
+
+```{r}
+plyr::ddply(prevdf, "Phylum", function(df1){cbind(mean(df1$Prevalence),sum(df1$Prevalence))})
+```
+
+Filter phyla:
+```{r}
+filterPhylaGenital = c("Dependentiae", "Entotheonellaeota", "Latescibacteria", "Cyanobacteria")
+ps_genital = subset_taxa(ps_genital, !Phylum %in% filterPhylaGenital)
+ps_genital
+```
+
+#### Prevalence Filtering
+```{r}
+# Subset to the remaining phyla
+prevdf1 = subset(prevdf, Phylum %in% get_taxa_unique(ps_genital, "Phylum"))
+ggplot(prevdf1, aes(TotalAbundance, Prevalence / nsamples(ps_genital),color=Phylum)) +
+  # Include a guess for parameter
+  geom_hline(yintercept = 0.05, alpha = 0.5, linetype = 2) +  geom_point(size = 2, alpha = 0.7) +
+  scale_x_log10() +  xlab("Total Abundance") + ylab("Prevalence [Frac. Samples]") +
+  facet_wrap(~Phylum) + theme(legend.position="none")
+```
+
+Set prevalence threshold to ten percent and remove taxa that occur in less than ten percent of genital samples:
+```{r}
+# Define prevalence threshold as 10% of total samples
+prevalenceThresholdGenital = 0.1 * nsamples(ps_genital)
+prevalenceThresholdGenital
+```
+
+```{r}
+# Execute prevalence filter, using `prune_taxa()` function
+keepTaxagenital = rownames(prevdf1)[(prevdf1$Prevalence >= 9)]
+ps_genital = prune_taxa(keepTaxagenital, ps_genital)
+ps_genital
+```
+
+Save phyloseq object for future analyses, without need for re-doing filtering steps:
+*create separate folder for PhyloSeq objects to keep things organized
+```{r}
+saveRDS(ps_genital, "./PhyloseqObjects/ps_genital.rds")
+```
+
+Read in phyloseq object if not currently in environment:
+```{r}
+ps_genital <- readRDS("./PhyloseqObjects/ps_genital.rds")
+genital_dataset <- read.csv("./PiCrust2_in/genital_dataset_FunkyTax.csv", header = TRUE, row.names = 1)
+```
+
+##### Obtaining files for PiCrust2
+
+* Rename ASVs with short name, instead of full sequence
+```{r, eval=FALSE}
+genital_dna <- Biostrings::DNAStringSet(taxa_names(ps_genital))
+names(genital_dna) <- taxa_names(ps_genital)
+ps_genital_short <- merge_phyloseq(ps_genital, genital_dna)
+taxa_names(ps_genital_short) <- paste0("ASV", seq(ntaxa(ps_genital_short)))
+ps_genital_short
+```
+
+* Save fasta file from phyloseq object
+```{r, eval=FALSE}
+Biostrings::writeXStringSet(refseq(ps_genital_short), "./PiCrust2_in/genital_seqs.fasta")
+```
+
+* Save otu table as csv with taxa as rows
+```{r, eval=FALSE}
+# Extract abundance matrix from the phyloseq object
+genital_otu = as(otu_table(ps_genital_short), "matrix")
+# transpose if necessary
+genital_otu <- t(genital_otu)
+# Coerce to data.frame
+genital_otu_df = as.data.frame(genital_otu)
+write.table(genital_otu_df, "./PiCrust2_in/genital_otu.tsv", sep = "\t", quote = FALSE)
+```
+
+
+### 1. Obtaining basic stats to report in methods.
+
+Number of ASVs per group and mean, min, and max per sample in the genital group
+
+Per sample number of ASVs:
+```{r per group}
+sub<-which(dataset$sample_type=="genital")
+pa_matrix<-decostand(seqtab.nochim,method="pa")
+apply(pa_matrix[sub,],1,sum) # view per sample number of ASVs
+```
+
+Number of samples that include the ASVs:
+```{r}
+hist(apply(pa_matrix[sub,],2,sum)) # nb of samples that include the ASVs
+```
+
+```{r, results='hide'}
+stem(apply(pa_matrix[sub,],2,sum)) # nb of samples that include the ASVs
+```
+
+Min, mean, and max number of ASVs per sample:
+```{r}
+summary(apply(pa_matrix[sub,],1,sum)) # get mean, min, and max of number of ASVs per sample
+```
+
+Histogram of distribution of number of ASVs per sample:
+```{r}
+hist(apply(pa_matrix[sub,],1,sum)) # see histogram of nb of ASVs per sample distribution
+```
+
+
+### DIVERSITY
+#### Alpha-diversity (Shannon) and species richness (Chao1)
+* On unfiltered ps object
+
+* CHAO1 and Shannon Index
+
+```{r computation}
+adiv<-estimate_richness(ps,measures=c("Observed","Shannon","Chao1"))
+adiv_genital <- subset(adiv, rownames(adiv) %in% rownames(genital_dataset))
+genital_dataset$alphadiv<-adiv_genital$Shannon
+hist(genital_dataset$alphadiv)
+genital_dataset$chao1<-adiv_genital$Chao1
+hist(genital_dataset$chao1)
+genital_dataset$evenness<-adiv_genital$Shannon/log(adiv_genital$Observed)
+```
+
+###### Boxplots
+
+* Change order of x-axis for boxplots:
+```{r}
+genital_dataset$age_group <- factor(genital_dataset$age_group, levels = c("<1", "1-4", "5-9", "10-14", "≥15"))
+genital_dataset$infant <- factor(genital_dataset$infant, levels = c("Yes", "No"))
+```
+
+* CHAO1 by age_group
+
+```{r boxplots}
+p_age_chao_genital<-ggplot(genital_dataset, aes(age_group, chao1,fill=age_group, color=age_group)) +
+  theme_classic()+
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("Age Group")+ylab("SPECIES RICHNESS (Chao1)")+
+  theme(axis.text.x  = element_text(size=12, color="black"),
+        axis.text.y  = element_text(size=12, color="black"),
+        axis.title.x  = element_text(size=14, color="black",face="bold"),
+        axis.title.y  = element_text(size=14, color="black",face="bold"))+
+  scale_fill_manual(name="Age group",values=c("blue","dodgerblue","purple","red", "cornflowerblue", "coral" )) +
+  scale_color_manual(name="Age group",values=c("black","black","black","black","black","black")) +
+  guides(fill=F,color=F) + stat_compare_means()
+p_age_chao_genital
+```
+
+* CHAO1 by sex
+```{r}
+p1_sex<-ggplot(genital_dataset, aes(sex, chao1,fill=sex, color=sex)) +
+  theme_bw()+
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("Sex")+ylab("SPECIES RICHNESS (Chao1)")+
+  theme(axis.text.x  = element_text(size=12, color="black"),
+        axis.text.y  = element_text(size=12, color="black"),
+        axis.title.x  = element_text(size=14, color="black",face="bold"),
+        axis.title.y  = element_text(size=14, color="black",face="bold"))+
+  guides(fill=F,color=F) + stat_compare_means()
+p1_sex
+```
+
+* CHAO1 by infant yes or no
+```{r}
+p1_infant<-ggplot(genital_dataset, aes(infant, chao1,fill=infant, color=infant)) +
+  theme_bw()+
+  geom_boxplot(alpha=0.6)+geom_jitter(width=0.1) +
+  xlab("infant")+ylab("SPECIES RICHNESS (Chao1)")+
+  theme(axis.text.x  = element_text(size=12, color="black"),
+        axis.text.y  = element_text(size=12, color="black"),
+        axis.title.x  = element_text(size=14, color="black",face="bold"),
+        axis.title.y  = element_text(size=14, color="black",face="bold"))+
+  guides(fill=F,color=F) + stat_compare_means()
+p1_infant
+```
+
+
+* Shannon Index by age groups
+
+```{r}
+p_age_shannon_genital<-ggplot(genital_dataset, aes(age_group, alphadiv,fill=age_group)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA)+
+  geom_jitter(width=0.1) +
+  xlab("Age group")+ylab("ALPHA-DIVERSITY (Shannon Index)") +
+  scale_fill_manual(name="Age group",values=c("cornflowerblue","dodgerblue","purple","red", "blue")) +
+  guides(fill=F) + 
+  stat_compare_means() + 
+  ggtitle(label = "Genital") + 
+  theme(plot.title = element_text(face = "bold"))
+p_age_shannon_genital
+```
+
+* Shannon Index by sex
+
+```{r}
+p3_sex_genital<-ggplot(genital_dataset, aes(sex, alphadiv,fill=sex)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) +
+  geom_jitter(width=0.1) +
+  xlab("Sex")+
+  ylab("ALPHA-DIVERSITY (Shannon Index)") +
+  ylim(1.5,5.5) +
+  scale_fill_manual(name = "Sex", values = c("#E41A1C", "#377EB8")) +
+  guides(fill=F) + 
+  stat_compare_means() + 
+  ggtitle(label = "Genital") + 
+  theme(plot.title = element_text(face = "bold"))
+p3_sex_genital
+```
+
+* Shannon index by infant yes or no
+```{r}
+p_infant_shannon_genital<-ggplot(genital_dataset, aes(infant, alphadiv,fill=infant)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) + 
+  geom_jitter(width=0.1, aes(shape = sex)) +
+  xlab("Infant")+ylab("ALPHA-DIVERSITY (Shannon Index)") +
+  scale_fill_manual(name="Life stage", labels = c("infant", "non-infant"), values=c("cornflowerblue","purple")) +
+  scale_shape_manual(name= "Sex", labels = c("female", "male"), values = c(15, 0)) +
+  guides(color=F) + 
+  stat_compare_means() + 
+  ggtitle(label = "Genital") + 
+  theme(plot.title = element_text(face = "bold"),
+        axis.ticks.x = element_blank(),
+        axis.text.x = element_blank()) + 
+  ylim(1.5,5.5) +
+  xlab(NULL)
+p_infant_shannon_genital
+```
+
+* Shannon index by old yes or no
+```{r}
+p_old_shannon_genital<-ggplot(genital_dataset, aes(old, alphadiv,fill=old)) +
+  theme_classic() +
+  geom_boxplot(alpha=0.6, outlier.shape = NA) + geom_jitter(width=0.1) +
+  xlab("15 years or older") + 
+  ylab("ALPHA-DIVERSITY (Shannon Index)") +
+  scale_fill_manual(name="Old",values=c("#AF6125", "#F4E3C7")) +
+  guides(fill=F) + 
+  stat_compare_means() + 
+  ggtitle(label = "Genital") + 
+  theme(plot.title = element_text(face = "bold")) +
+  ylim(1.5,5.5)
+p_old_shannon_genital
+```
+
+
+### Ordinations
+
+* Compute ordination (dada2 tutorial)
+```{r}
+# Ordination (from DADA2 tutorial)
+ps_genital.prop <- transform_sample_counts(ps_genital, function(otu) otu/sum(otu))
+
+bray_genital <- phyloseq::distance(ps_genital.prop, method = "bray")
+ord.nmds.bray_genital <- ordinate(ps_genital.prop, method="NMDS", distance="bray")
+ord.pcoa.bray_genital <- ordinate(ps_genital.prop, method="PCoA", distance="bray")
+
+NMDS_df_genital <- as.data.frame(ord.nmds.bray_genital$points)
+genital_dataset$NMDS1 <- NMDS_df_genital$MDS1
+genital_dataset$NMDS2 <- NMDS_df_genital$MDS2
+```
+* Plot
+```{r}
+p_ord_NMDS <- plot_ordination(ps_genital.prop, ord.nmds.bray_genital, color="infant", shape = "age_group")
+p_ord_PCoA <- plot_ordination(ps_genital.prop, ord.pcoa.bray_genital, color="sex", title="Bray PCoA")
+
+p_ord_NMDS_genital <- p_ord_NMDS + 
+  theme_classic() + 
+  scale_color_manual(name = "Infant", values = c("purple", "cornflowerblue")) + 
+  scale_shape_manual(name = "Age group", values = c(16, 17, 18, 1, 0)) + 
+  ggtitle(label = "Genital") + 
+  theme(plot.title = element_text(face = "bold"))
+
+p_ord_NMDS_genital_sex <- ggplot(genital_dataset, aes(NMDS1, NMDS2, color = sex)) + 
+  geom_point() +
+  theme_classic() +
+  scale_color_manual(name = "Sex", labels = c("female", "male"), values = c("#e7797a", "#8eb2d5")) +
+#  scale_shape_manual(name = "Age group", values = c(16, 18, 0, 1, 17)) + 
+  ggtitle(label = "Genital") + 
+  theme(plot.title = element_text(face = "bold"))
+
+p_ord_NMDS_genital
+p_ord_NMDS_genital_sex
+p_ord_PCoA
+```
+
+##### PCoA (alternative) - age_group, infant, and sex
+
+* Compute:
+```{r, results='hide'}
+# Create function geo means for Variance Stabilizing Transformation
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+
+# Variance Stabilizing Transformation
+test.phyloseq.dds_genital<-phyloseq_to_deseq2(ps_genital,~sex)
+test.phyloseq.dds_genital = estimateSizeFactors(test.phyloseq.dds_genital, geoMeans = apply(counts(test.phyloseq.dds_genital), 1, gm_mean))
+vst.blind_genital <- DESeq2::varianceStabilizingTransformation(test.phyloseq.dds_genital, blind=TRUE)
+vst.blind.Mat_genital <- SummarizedExperiment::assay(vst.blind_genital) # Extract transformed OTU table
+vst.blind.Mat_genital<-t(vst.blind.Mat_genital)
+vst.blind.Mat_genital[which(vst.blind.Mat_genital<0)]<-0
+dists_genital <- dist(t(assay(vst.blind_genital)))
+
+# Computing Bray-Curtis Dissimilarities and PCoA
+comm.vst.blind.Mat_genital <- vegdist(vst.blind.Mat_genital, "bray")
+PCoA.comm.vst.blind.Mat_genital<-capscale(comm.vst.blind.Mat_genital~1,distance="bray")
+PCoA.comm.vst.blind.Mat_genital$CA$eig[1:3]/sum(PCoA.comm.vst.blind.Mat_genital$CA$eig)
+PCoA.comm.vst.blind.Mat_genital
+eig_genital <- PCoA.comm.vst.blind.Mat_genital$CA$eig
+
+# Portion of total variation in community structure explained by each of the main three components
+eig_genital[1]/sum(abs(eig_genital)) 
+eig_genital[2]/sum(abs(eig_genital)) 
+eig_genital[3]/sum(abs(eig_genital)) 
+
+row.names(genital_dataset)==row.names(scores(PCoA.comm.vst.blind.Mat_genital)$sites)
+genital_dataset$PCoA1<-scores(PCoA.comm.vst.blind.Mat_genital)$sites[,1]
+genital_dataset$PCoA2<-scores(PCoA.comm.vst.blind.Mat_genital)$sites[,2]
+```
+
+* Plot
+###### PCA of rectal samples colored by sex:
+```{r}
+PCA_genital <- qplot(PCoA1, PCoA2, xlab="PCoA1",
+              ylab="PCoA2", color=sex, data=(genital_dataset))
+
+genital_dataset$infant <- factor(genital_dataset$infant, levels = c("Yes", "No"))
+
+PCA_genital_sex <- PCA_genital + theme_classic() + scale_color_manual(name = "Sex", values = c("cornflowerblue", "purple"))
+
+PCA_genital_sex
+```
+
+###### PCA of genital samples colored by infant vs non-infant:
+```{r}
+genital_dataset$infant <- factor(genital_dataset$infant, levels = c("Yes", "No"))
+
+PCA_genital_infant <- qplot(PCoA1, PCoA2, xlab="PCoA1",
+              ylab="PCoA2", color=infant, data=(genital_dataset))
+PCA_genital_infant <- PCA_genital_infant + theme_classic() + scale_color_manual(name = "Infant", values = c("cornflowerblue", "purple"))
+
+PCA_genital_infant
+```
+
+###### PCA of rectal samples colored by age group:
+```{r}
+PCA_genital <- qplot(PCoA1, PCoA2, xlab="PCoA1",
+              ylab="PCoA2", color=age_group, data=(genital_dataset))
+PCA_genital + theme_classic() 
+```
+
+#### PERMANOVA
+
+Sex explains surprisingly little of the variance (10.6%)? 
+```{r}
+# With DESeq distances
+permanova.genital.age_group<-adonis(comm.vst.blind.Mat_genital ~ age_group + sex, data=genital_dataset, permutations = 9999)
+permanova.genital.age_group$aov.tab
+
+# With Bray-Curtis distances (used in NMDS plot)
+permanova.genital.age_group<-adonis(bray_genital ~ age_group + sex, data=genital_dataset, permutations = 9999)
+permanova.genital.age_group$aov.tab
+```
+
+* Pairwise post-hoc tests - Is there one (or more) age group(s) that is/are driving the differences?
+```{r}
+pairwise.adonis(bray_genital, genital_dataset$age_group)
+```
+
+
+### Agglomerate before relative and differential abundance tests
+* agglomerate at the genus level
+
+```{r}
+ps_genital_glom <- tax_glom(ps_genital, "Genus", NArm = FALSE)
+ps_genital_glom
+```
+Save phyloseq object for easy re-loading for future analyses:
+```{r, eval=FALSE}
+saveRDS(ps_genital_glom, "./PhyloseqObjects/ps_genital_glom.rds")
+```
+
+#### TOP ASVs GENITAL SAMPLES
+
+* Compute
+```{r top otus, results='hide'}
+genital_comm<-as.matrix(t(otu_table(ps_genital_glom, taxa_are_rows=FALSE)))
+dim(genital_comm) #80 52
+rel_abun_genital<-sweep(genital_comm, 2, apply(genital_comm,2,sum), `/`)
+dim(rel_abun_genital) #80 52
+apply(rel_abun_genital,2,sum)
+dim(rel_abun_genital)[1]->t
+#apply(rel_abun_genital,1,sum)
+order(apply(rel_abun_genital,1,sum))[(t-9):t]
+top10_asvs_genital<-names(apply(rel_abun_genital,1,sum)[order(apply(rel_abun_genital,1,sum))[(t-9):t]])
+
+taxa[top10_asvs_genital,]->top10_taxa_genital
+row.names(top10_taxa_genital)<-c(length(row.names(top10_taxa_genital)):1)
+paste("asv_",row.names(top10_taxa_genital),sep="")->row.names(top10_taxa_genital)
+
+# Test for changes in relative abundance in dominant taxa
+rel_abun_top10_asvs_genital<-rel_abun_genital[top10_asvs_genital,]
+row.names(rel_abun_top10_asvs_genital)<-row.names(top10_taxa_genital)
+rel_abun_top10_asvs_genital<-t(rel_abun_top10_asvs_genital)
+rel_abun_top10_asvs_genital<-as.data.frame(rel_abun_top10_asvs_genital)
+rel_abun_top10_asvs_genital$sample_ID<-row.names(rel_abun_top10_asvs_genital)
+```
+
+```{r, results='hide'}
+#relative abundance by age_group
+genital_dataset$age_group[as.factor(row.names(rel_abun_top10_asvs_genital))]->rel_abun_top10_asvs_genital$age_group
+
+#relative abundance by infant
+genital_dataset$infant[as.factor(row.names(rel_abun_top10_asvs_genital))]->rel_abun_top10_asvs_genital$infant
+melt_rel_abun_top10_asvs_genital<-melt(rel_abun_top10_asvs_genital)
+
+#relative abundance by sex
+genital_dataset$sex[as.factor(row.names(rel_abun_top10_asvs_genital))]->rel_abun_top10_asvs_genital$sex
+
+genital_dataset$old[as.factor(row.names(rel_abun_top10_asvs_genital))]->rel_abun_top10_asvs_genital$old
+
+melt_rel_abun_top10_asvs_genital<-melt(rel_abun_top10_asvs_genital)
+
+#kruskal-wallace test for differences by age_group
+for (i in 1:10){
+  print(colnames(rel_abun_top10_asvs_genital[i]))
+  print(kruskal.test(rel_abun_top10_asvs_genital[,i] ~ age_group, data=rel_abun_top10_asvs_genital))
+  print(dunnTest(rel_abun_top10_asvs_genital[,i] ~ age_group, data=rel_abun_top10_asvs_genital, method="bh"))
+}
+
+#wilcoxon for relative abundance differences by infant
+wilcoxon_genital <- c()
+
+for (i in 1:10){
+  print(colnames(rel_abun_top10_asvs_genital[i]))
+  print(wilcox.test(rel_abun_top10_asvs_genital[,i] ~ infant, data=rel_abun_top10_asvs_genital))
+  wilcoxon_genital <- c(wilcoxon_genital, wilcox.test(rel_abun_top10_asvs_genital[,i] ~ infant, data=rel_abun_top10_asvs_genital)$p.value)
+}
+
+p.adjust(wilcoxon_genital, method = "fdr", n = length(wilcoxon_genital))
+
+
+#Another method - is p-value correction above even necessary and/or correct?
+compare_means(c(asv_10, asv_9, asv_8, asv_7, asv_6, asv_5, asv_4, asv_3, asv_2, asv_1) ~ infant, rel_abun_top10_asvs_genital, method = "wilcox.test", p.adjust.method = "fdr")
+
+#wilcoxon for relative abundance differences by sex
+#for (i in 1:10){
+#  print(colnames(rel_abun_top10_asvs_genital[i]))
+#  print(wilcox.test(rel_abun_top10_asvs_genital[,i] ~ sex, data=rel_abun_top10_asvs_genital))
+#}
+
+#wilcoxon_genital_sex = c(0.03289, 0.04857, 0.001512, 0.0002067, 1.851e-06, 2.523e-09, 0.05243, 0.1181, 5.863e-11, 1.15e-05)
+
+#adj.pvalue.wilcoxon.genital_sex <- p.adjust(wilcoxon_genital_sex, method = "fdr", n = length(wilcoxon_genital_sex))
+```
+
+###### Print top 10 ASVs for genital samples:
+```{r}
+top10_taxa_genital
+```
+
+```{r}
+# better labels
+asv_labels_genital <- c("Lachnospiraceae\ngen.", "Fusobacterium", "Ezakiella", "Campylobacter\ncorcagiensis", "Corynebacterium\npseudogenitalium", "Lactobacillus", "Actinobacillus", "Prevotella_9", "Corynebacterium\nglucuronolyticum", "Porphyromonas")
+```
+
+###### Plot variation in relative abundance across sex for top 10 ASVs
+```{r}
+p_top10_genital_sex<-ggplot(melt_rel_abun_top10_asvs_genital, aes(variable, value*100, fill= sex))+theme_classic()+
+  geom_boxplot(alpha=0.5)+
+  xlab(NULL)+ylab("RELATIVE ABUNDANCE (%)")+
+  theme(axis.text.x  = element_text(size = 7,color="black", face = "italic", angle=-50, hjust = 0, vjust=0.5),
+        axis.title.y  = element_text(size=10, color="black")) +
+  scale_x_discrete(labels = asv_labels_genital) +
+  stat_compare_means(label = "p.signif", hide.ns = TRUE)# +
+  #ggtitle(label = "Top 10 ASVs in genital samples")
+p_top10_genital_sex
+```
+
+
+## DIFFERENTIAL ABUNDANCE GENITAL SAMPLES
+* Compute differentially abundant taxa in MALES vs FEMALES
+```{r}
+#transform phyloseq object to deseq object
+genital.ddseq = phyloseq_to_deseq2(ps_genital_glom, ~sex)
+
+#function to avoid error with 0s in case of a a high prevalence of sparsely sampled OTUs 
+gm_mean = function(x, na.rm=TRUE){
+  exp(sum(log(x[x > 0]), na.rm=na.rm) / length(x))
+}
+#apply function to deseq object (replaces 0s with 1s, I think)
+geoMeans = apply(counts(genital.ddseq), 1, gm_mean)
+genital.ddseq = estimateSizeFactors(genital.ddseq, geoMeans = geoMeans)
+genital.ddseq = DESeq(genital.ddseq, test="Wald", fitType="local")
+```
+
+* Create a table of the results of the tests
+```{r, results='hide'}
+res.genital = results(genital.ddseq, cooksCutoff = FALSE)
+alpha = 0.01
+sigtab.genital = res.genital[which(res.genital$padj < alpha), ]
+sigtab.genital = cbind(as(sigtab.genital, "data.frame"), as(tax_table(ps_genital)[rownames(sigtab.genital), ], "matrix"))
+head(sigtab.genital)
+```
+* info about analysis
+
+Number of taxa that are differentially expressed - 27
+```{r}
+dim(sigtab.genital)
+mcols(res.genital, use.names = TRUE)
+```
+
+#### logfold change of differentially abundant taxa in male macaques
+```{r}
+sigtab.genital <- subset(sigtab.genital, sigtab.genital$log2FoldChange <= -2 | sigtab.genital$log2FoldChange >= 2)
+
+theme_set(theme_classic())
+
+# Phylum order
+x = tapply(sigtab.genital$log2FoldChange, sigtab.genital$Phylum, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.genital$Phylum = factor(as.character(sigtab.genital$Phylum), levels=names(x))
+# Genus order
+x = tapply(sigtab.genital$log2FoldChange, sigtab.genital$Genus, function(x) max(x))
+x = sort(x, TRUE)
+sigtab.genital$Genus = factor(as.character(sigtab.genital$Genus), levels=names(x))
+
+p_DiffExp_genital_sex <- ggplot(sigtab.genital, aes(x=Genus, y=log2FoldChange, color=Phylum, size = baseMean)) +
+  geom_point() + 
+  geom_hline(yintercept = 0, linetype="dotted", alpha=0.5) + 
+  xlab(NULL) + 
+  guides(size = guide_legend(title = "Mean normalized\ncount")) +
+  scale_color_manual(name = "Phylum", values = c("#A50026", "#FDAE61", "mediumorchid", "#313695", "#4575B4", "#74ADD1","#FEE090","#ABD9E9", "#D73027", "#E0F3F8","#ABD9E9")) +
+  theme(axis.text.x = element_text(color = "black", face = "italic", angle = -50, hjust = 0, vjust=0.5),
+        plot.title = element_text(face = "bold"),
+        legend.title = element_text(size = 9)) +
+  ggtitle(label = "Genital", subtitle = "males vs. females")
+
+p_DiffExp_genital_sex
+
+ggsave("~/Documents/Data/Cayo_microbiome/Analysis/Figures/DiffExp_genital_sex.pdf", width = 8, height = 5, useDingbats = FALSE)
+```
