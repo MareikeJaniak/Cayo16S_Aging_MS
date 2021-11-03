@@ -1,4 +1,6 @@
 # Cayo16S_Aging_MS
+[![DOI](https://zenodo.org/badge/329967305.svg)](https://zenodo.org/badge/latestdoi/329967305)
+
 
 Code used for Janiak et al. (2021).
 
