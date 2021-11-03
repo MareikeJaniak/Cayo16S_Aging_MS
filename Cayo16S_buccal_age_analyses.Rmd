@@ -23,7 +23,7 @@ taxa <- read.csv("./taxaGF.csv", row.names = 1)
 
 * Load metadata
 ```{r}
-dataset <- read.csv("./Cayo16S_metadata_Aging_MS.txt",header=T,row.names = 1)
+dataset <- read.delim("./Cayo16S_metadata_Aging_MS.txt",header=T,row.names = 1)
 quant_data <- read.delim("./Cayo16S_copy_number_data.tsv", header = T)
 quant_data <- quant_data$copy_number
 
